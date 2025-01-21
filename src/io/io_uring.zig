@@ -231,11 +231,19 @@ pub fn Loop(comptime options: Options) type {
                         sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
                     }
                 },
+                // FIXME: IORING_TIMEOUT_ETIME_SUCCESS seems to have no effect here
                 .timeout => |*ts| sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS),
                 // TODO: support cancelling timeouts
                 .cancel => |op| switch (op) {
                     .all_io => |fd| io_uring_prep_cancel_fd(sqe, fd, linux.IORING_ASYNC_CANCEL_ALL),
-                    .completion => |comp| sqe.prep_cancel(@intCast(@intFromPtr(comp)), 0),
+                    .completion => |comp| {
+                        if (comp.operation == .timeout) {
+                            // prepare a timeout removal instead
+                            sqe.prep_timeout_remove(@intCast(@intFromPtr(comp)), 0);
+                        } else {
+                            sqe.prep_cancel(@intCast(@intFromPtr(comp)), 0);
+                        }
+                    },
                 },
                 .fds_update => |op| switch (comptime options.io_uring.direct_descriptors_mode) {
                     true => io_uring_prep_files_update(sqe, op.fds, op.offset),

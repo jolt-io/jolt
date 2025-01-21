@@ -57,14 +57,14 @@ pub fn main() !void {
     //loop.accept(BufferPool, &recv_pool, &accept_c, 0, onAccept);
     loop.close(&accept_c, 0);
 
-    //std.time.ns_per_ms
-
+    // fire after 3s
     var timer_c = Completion{};
-    // fire after 3000 ms
-    loop.timeout(&timer_c, BufferPool, &recv_pool, 3000 * std.time.ns_per_ms, onTimeout);
+    loop.timeout(&timer_c, BufferPool, &recv_pool, 2 * std.time.ns_per_s, onTimeout);
 
     try loop.run();
 }
+
+threadlocal var cancel_c = Completion{};
 
 fn onTimeout(
     recv_pool: *BufferPool,
@@ -73,15 +73,20 @@ fn onTimeout(
     result: DefaultLoop.TimeoutError!void,
 ) void {
     _ = recv_pool;
-    _ = loop;
-    _ = c;
+
+    // cancel right away!
+    //var cancel_c = Completion{};
+    loop.cancel(.completion, c, &cancel_c);
 
     result catch |e| switch (e) {
-        error.Cancelled => std.debug.print("operation cancelled\n", .{}),
+        error.Cancelled => {
+            std.debug.print("operation cancelled\n", .{});
+            return;
+        },
         error.Unexpected => @panic(@errorName(e)),
     };
 
-    std.debug.print("timeout occured\n", .{});
+    std.debug.print("successful timeout\n", .{});
 }
 
 fn onAccept(recv_pool: *BufferPool, loop: *DefaultLoop, c: *Completion, result: DefaultLoop.AcceptError!io_uring.Socket) void {
