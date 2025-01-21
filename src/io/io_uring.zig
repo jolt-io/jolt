@@ -11,9 +11,10 @@ const IO_Uring = linux.IoUring;
 const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
 const Intrusive = @import("../queue.zig").Intrusive;
-const Options = @import("Options.zig");
+const Options = @import("options.zig").Options;
 const BufferPool = @import("../buffer_pool.zig").BufferPool(.io_uring);
 
+// 1 millisecond in nanoseconds
 const OneMillisecond: comptime_int = 1e6;
 
 // TODO: add support for this in zig std.

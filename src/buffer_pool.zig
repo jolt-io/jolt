@@ -3,9 +3,7 @@ const mem = std.mem;
 const linux = std.os.linux;
 const io_uring_buf_ring = linux.io_uring_buf_ring;
 const IO_Uring = linux.IoUring;
-
-// TODO: move this out of here
-pub const IoEngine = enum { io_uring, iocp };
+const IoEngine = @import("io/options.zig").IoEngine;
 
 // Note to myself:
 // a buffer pool implementation must satisfy these public functions:
@@ -30,7 +28,7 @@ pub fn BufferPool(comptime io_engine: IoEngine) type {
             pool: [*]u8,
             /// Size of each buffer in buffers.
             buffer_size: u32,
-            /// Number of buffers in `buffers`, number of `io_uring_buf structures` in br.
+            /// Number of buffers in `buffers`, number of `io_uring_buf structures` in buffer ring.
             buffer_count: u16,
             /// ID of this group, must be unique in ring.
             group_id: u16,
