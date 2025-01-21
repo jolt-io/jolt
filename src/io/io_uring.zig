@@ -14,9 +14,6 @@ const Intrusive = @import("../queue.zig").Intrusive;
 const Options = @import("options.zig").Options;
 const BufferPool = @import("../buffer_pool.zig").BufferPool(.io_uring);
 
-// 1 millisecond in nanoseconds
-const OneMillisecond: comptime_int = 1e6;
-
 // TODO: add support for this in zig std.
 inline fn io_uring_prep_cancel_fd(sqe: *io_uring_sqe, fd: linux.fd_t, flags: u32) void {
     sqe.prep_rw(.ASYNC_CANCEL, fd, 0, 0, 0);
@@ -234,9 +231,7 @@ pub fn Loop(comptime options: Options) type {
                         sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
                     }
                 },
-                .timeout => |*ts| {
-                    sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS);
-                },
+                .timeout => |*ts| sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS),
                 // TODO: support cancelling timeouts
                 .cancel => |op| switch (op) {
                     .all_io => |fd| io_uring_prep_cancel_fd(sqe, fd, linux.IORING_ASYNC_CANCEL_ALL),
@@ -600,20 +595,44 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
+        pub const TimeoutError = CancellationError || UnexpectedError;
+
+        /// TODO: we might want to prefer IORING_TIMEOUT_ABS here.
         /// Queues a timeout operation.
-        pub fn timeout(self: *Self, completion: *Completion) void {
+        /// nanoseconds are given as u63 for coercion to i64.
+        pub fn timeout(
+            self: *Self,
+            completion: *Completion,
+            comptime T: type,
+            userdata: *T,
+            ns: u63,
+            comptime callback: *const fn (
+                userdata: *T,
+                loop: *Self,
+                completion: *Completion,
+                result: TimeoutError!void,
+            ) void,
+        ) void {
             completion.* = .{
                 .next = null,
                 .operation = .{
-                    .timeout = .{
-                        .sec = 0,
-                        .nsec = 3000 * OneMillisecond,
-                    },
+                    .timeout = .{ .sec = 0, .nsec = ns },
                 },
-                .userdata = null,
+                .userdata = userdata,
                 .callback = comptime struct {
-                    fn wrap(_: *Self, _: *Completion) void {
-                        std.debug.print("timeout done!\n", .{});
+                    fn wrap(loop: *Self, c: *Completion) void {
+                        const cqe = c.cqe.?;
+                        const res = cqe.res;
+
+                        const result: TimeoutError!void = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                            .TIME => {}, // still a success
+                            .INVAL => unreachable,
+                            .FAULT => unreachable,
+                            .CANCELED => error.Cancelled,
+                            else => |err| posix.unexpectedErrno(err),
+                        } else {};
+
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, result });
                     }
                 }.wrap,
             };
