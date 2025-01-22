@@ -58,4 +58,6 @@ pub const Options = struct {
         /// TODO: This can be supported on Windows too via userland implementation, there's also RIO (Registered I/O) which might help.
         buffer_pool_mode: bool = false,
     } = .{},
+    // TODO:
+    iocp: struct {} = .{},
 };
