@@ -77,7 +77,7 @@ pub fn Loop(comptime options: Options) type {
         /// io operations that're completed and ready to fly
         completed: Intrusive(Completion) = .{},
         /// count of operations that we're waiting to be done
-        io_pending: usize = 0,
+        io_pending: u64 = 0,
 
         /// Initializes a new event loop backed by io_uring.
         pub fn init() !Self {
@@ -200,7 +200,7 @@ pub fn Loop(comptime options: Options) type {
                         // NOTE: Direct descriptors don't support SOCK_CLOEXEC flag at the moment.
                         // https://github.com/axboe/liburing/issues/1330
                         sqe.prep_multishot_accept_direct(op.socket, &op.addr, &op.addr_size, 0);
-                        // we want to use direct descriptors
+                        // op.socket is also a direct descriptor
                         sqe.flags |= linux.IOSQE_FIXED_FILE;
                     },
                     // regular multishot accept
@@ -208,7 +208,7 @@ pub fn Loop(comptime options: Options) type {
                 },
                 .recv => |op| {
                     if (comptime options.io_uring.buffer_pool_mode) {
-                        // read multishot requires everything to be zero since the buffer will be selected automatically
+                        // recv multishot requires everything to be zero since the buffer will be selected automatically
                         sqe.prep_rw(.RECV, op.socket, 0, 0, 0);
                         // which buffer group to use, in liburing, field set is `buf_group` but it's actually defined as a union
                         sqe.buf_index = op.buf_pool.group_id;
@@ -229,6 +229,15 @@ pub fn Loop(comptime options: Options) type {
                         // NOTE: Following flag only works on provided buffers.
                         // https://github.com/axboe/liburing/issues/1331#issuecomment-2599784984
                         sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+                    }
+                },
+                .send => |op| {
+                    sqe.prep_rw(.SEND, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
+                    sqe.rw_flags = 0;
+
+                    // we want to use direct descriptors
+                    if (comptime options.io_uring.direct_descriptors_mode) {
+                        sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
                 },
                 // FIXME: IORING_TIMEOUT_ETIME_SUCCESS seems to have no effect here
@@ -508,7 +517,8 @@ pub fn Loop(comptime options: Options) type {
                     socket: Socket,
                     buffer_pool: *BufferPool,
                     buffer_id: u16,
-                    result: RecvError!u32, // actually u31
+                    /// u31 is preferred for coercion
+                    result: RecvError!u31,
                 ) void,
                 // regular
                 false => *const fn (
@@ -517,7 +527,8 @@ pub fn Loop(comptime options: Options) type {
                     completion: *Completion,
                     socket: Socket,
                     buffer: []u8,
-                    result: RecvError!u32, // actually u31
+                    /// u31 is preferred for coercion
+                    result: RecvError!u31,
                 ) void,
             },
         ) void {
@@ -537,9 +548,9 @@ pub fn Loop(comptime options: Options) type {
                         const op = c.operation.recv;
 
                         // error or success
-                        const result: RecvError!u32 = if (res <= 0)
+                        const result: RecvError!u31 = if (res <= 0)
                             switch (@as(posix.E, @enumFromInt(-res))) {
-                                .SUCCESS => error.EndOfStream, // 0 reads are interpretted as errors
+                                .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
                                 .INTR => return loop.enqueue(c), // we're interrupted, try again
                                 .AGAIN => error.WouldBlock,
                                 .BADF => error.Unexpected,
@@ -603,6 +614,88 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
+        pub const SendError = error{
+            //EndOfStream,
+            AccessDenied,
+            WouldBlock,
+            FastOpenAlreadyInProgress,
+            AddressFamilyNotSupported,
+            FileDescriptorInvalid,
+            ConnectionResetByPeer,
+            MessageTooBig,
+            SystemResources,
+            SocketNotConnected,
+            FileDescriptorNotASocket,
+            OperationNotSupported,
+            BrokenPipe,
+            ConnectionTimedOut,
+        } || CancellationError || UnexpectedError;
+
+        /// Queues a send operation.
+        pub fn send(
+            self: *Self,
+            completion: *Completion,
+            comptime T: type,
+            userdata: *T,
+            socket: Socket,
+            buffer: []const u8,
+            comptime callback: *const fn (
+                userdata: *T,
+                loop: *Self,
+                completion: *Completion,
+                buffer: []const u8,
+                /// u31 is preferred for coercion
+                result: SendError!u31,
+            ) void,
+        ) void {
+            completion.* = .{
+                .next = null,
+                .operation = .{
+                    .send = .{
+                        .socket = socket,
+                        .buffer = buffer,
+                    },
+                },
+                .userdata = userdata,
+                .callback = comptime struct {
+                    fn wrap(loop: *Self, c: *Completion) void {
+                        const cqe = c.cqe.?;
+                        const res = cqe.res;
+
+                        const result: SendError!u31 = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                            //.SUCCESS => error.EndOfStream,
+                            .INTR => return loop.enqueue(c),
+                            .ACCES => error.AccessDenied,
+                            .AGAIN => error.WouldBlock,
+                            .ALREADY => error.FastOpenAlreadyInProgress,
+                            .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                            .BADF => error.FileDescriptorInvalid,
+                            .CONNRESET => error.ConnectionResetByPeer,
+                            .DESTADDRREQ => unreachable,
+                            .FAULT => unreachable,
+                            .INVAL => unreachable,
+                            .ISCONN => unreachable,
+                            .MSGSIZE => error.MessageTooBig,
+                            .NOBUFS => error.SystemResources,
+                            .NOMEM => error.SystemResources,
+                            .NOTCONN => error.SocketNotConnected,
+                            .NOTSOCK => error.FileDescriptorNotASocket,
+                            .OPNOTSUPP => error.OperationNotSupported,
+                            .PIPE => error.BrokenPipe,
+                            .TIMEDOUT => error.ConnectionTimedOut,
+                            .CANCELED => error.Cancelled,
+                            else => |err| posix.unexpectedErrno(err),
+                        } else @intCast(res);
+
+                        const buf = c.operation.send.buffer;
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, buf, result });
+                    }
+                }.wrap,
+            };
+
+            self.enqueue(completion);
+        }
+
         pub const TimeoutError = CancellationError || UnexpectedError;
 
         /// TODO: we might want to prefer IORING_TIMEOUT_ABS here.
@@ -648,8 +741,9 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
-        // Queues a cancel operation.
-        // If a handle is given as target, all I/O operations of the handle are cancelled.
+        /// FIXME: refactor
+        /// Queues a cancel operation.
+        /// If a handle is given as target, all I/O operations of the handle are cancelled.
         pub fn cancel(
             self: *Self,
             comptime cancel_type: Completion.Operation.CancelType,
@@ -887,6 +981,7 @@ pub fn Loop(comptime options: Options) type {
                 connect,
                 accept,
                 recv,
+                send,
                 timeout,
                 cancel,
                 fds_update,
@@ -903,7 +998,7 @@ pub fn Loop(comptime options: Options) type {
                         socket: Socket,
                         buf_pool: *BufferPool,
                     },
-                    // regular recv operation, similar to read
+                    // regular recv operation, similar to read but no offset
                     false => struct {
                         socket: Socket,
                         buffer: []u8,
@@ -923,7 +1018,6 @@ pub fn Loop(comptime options: Options) type {
                 // https://man7.org/linux/man-pages/man3/io_uring_prep_cancel.3.html
                 pub const CancelType = enum(u1) { all_io, completion };
 
-                // TODO: support for timeout cancels
                 pub const Cancel = union(CancelType) {
                     all_io: Handle,
                     completion: *Completion,
@@ -951,6 +1045,10 @@ pub fn Loop(comptime options: Options) type {
                     addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
                 },
                 recv: Recv,
+                send: struct {
+                    socket: linux.fd_t,
+                    buffer: []const u8,
+                },
                 timeout: linux.kernel_timespec,
                 cancel: Cancel,
                 fds_update: FdsUpdate,

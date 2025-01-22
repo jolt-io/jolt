@@ -54,12 +54,12 @@ pub fn main() !void {
 
     // Start accepting connections
     var accept_c = Completion{};
-    //loop.accept(BufferPool, &recv_pool, &accept_c, 0, onAccept);
-    loop.close(&accept_c, 0);
+    loop.accept(BufferPool, &recv_pool, &accept_c, 0, onAccept);
+    //loop.close(&accept_c, 0);
 
-    // fire after 3s
-    var timer_c = Completion{};
-    loop.timeout(&timer_c, BufferPool, &recv_pool, 2 * std.time.ns_per_s, onTimeout);
+    // fire after 2s
+    //var timer_c = Completion{};
+    //loop.timeout(&timer_c, BufferPool, &recv_pool, 2 * std.time.ns_per_s, onTimeout);
 
     try loop.run();
 }
@@ -89,14 +89,36 @@ fn onTimeout(
     std.debug.print("successful timeout\n", .{});
 }
 
+threadlocal var send_c = Completion{};
+threadlocal var hello = "hello";
+
 fn onAccept(recv_pool: *BufferPool, loop: *DefaultLoop, c: *Completion, result: DefaultLoop.AcceptError!io_uring.Socket) void {
     _ = c;
     const fd = result catch unreachable;
 
     //std.debug.print("got connection, fd: {}\n", .{fd});
 
-    const recv_c = allocator.create(Completion) catch unreachable;
-    loop.recv(recv_c, BufferPool, recv_pool, fd, recv_pool, onRecv);
+    //const recv_c = allocator.create(Completion) catch unreachable;
+    //loop.recv(recv_c, BufferPool, recv_pool, fd, recv_pool, onRecv);
+
+    loop.send(&send_c, BufferPool, recv_pool, fd, hello, onSend);
+}
+
+fn onSend(
+    userdata: *BufferPool,
+    loop: *DefaultLoop,
+    completion: *Completion,
+    buffer: []const u8,
+    /// u31 is preferred for coercion
+    result: DefaultLoop.SendError!u31,
+) void {
+    _ = userdata;
+    _ = loop;
+    _ = completion;
+    _ = buffer;
+    const len = result catch unreachable;
+
+    std.debug.print("{}\n", .{len});
 }
 
 fn onRecv(
@@ -106,7 +128,7 @@ fn onRecv(
     socket: io_uring.Socket,
     buffer_pool: *BufferPool,
     buffer_id: u16,
-    result: DefaultLoop.RecvError!u32,
+    result: DefaultLoop.RecvError!u31,
 ) void {
     _ = userdata;
     _ = loop;
@@ -117,9 +139,8 @@ fn onRecv(
         error.EndOfStream => return,
         else => unreachable,
     };
-    _ = len;
 
-    std.debug.print("{}\n", .{buffer_id});
+    std.debug.print("{s}\n", .{buffer_pool.get(buffer_id)[0..len]});
 
     buffer_pool.put(buffer_id);
 }
