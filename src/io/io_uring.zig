@@ -257,7 +257,6 @@ pub fn Loop(comptime options: Options) type {
                 },
                 // FIXME: IORING_TIMEOUT_ETIME_SUCCESS seems to have no effect here
                 .timeout => |*ts| sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS),
-                // TODO: support cancelling timeouts
                 .cancel => |op| switch (op) {
                     .all_io => |fd| io_uring_prep_cancel_fd(sqe, fd, linux.IORING_ASYNC_CANCEL_ALL),
                     .completion => |comp| {
