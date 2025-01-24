@@ -19,9 +19,43 @@ const DefaultLoop = Loop(.{
 const Completion = DefaultLoop.Completion;
 
 pub fn main() !void {
-    const a = std.math.maxInt(u64);
-    std.debug.print("{}\n", .{@as(u8, @intCast(a >> 56))});
+    var loop = try DefaultLoop.init();
+    defer loop.deinit();
 
+    try loop.directDescriptors(.sparse, 1);
+
+    const file = try std.fs.cwd().openFile("test.txt", .{ .mode = .read_only });
+    // register to ring
+    try loop.updateDescriptors(0, &[_]linux.fd_t{file.handle});
+    // file handle is at offset 0
+    const handle: linux.fd_t = 0;
+    // we don't need this anymore
+    file.close();
+
+    var read_c = Completion{};
+    var buffer: [1024]u8 = undefined;
+    loop.read(&read_c, Completion, &read_c, handle, &buffer, onRead);
+
+    try loop.run();
+}
+
+fn onRead(
+    userdata: *Completion,
+    loop: *DefaultLoop,
+    completion: *Completion,
+    buffer: []u8,
+    result: DefaultLoop.ReadError!u31,
+) void {
+    _ = userdata;
+    _ = loop;
+    _ = completion;
+
+    const len = result catch unreachable;
+
+    std.debug.print("{s}\n", .{buffer[0..len]});
+}
+
+pub fn main1() !void {
     var loop = try DefaultLoop.init();
     defer loop.deinit();
 
