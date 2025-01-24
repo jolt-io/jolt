@@ -1,7 +1,7 @@
 pub const IoEngine = enum {
-    /// Modern asynchronous I/O API for Linux.
+    /// Modern asynchronous I/O API of Linux.
     io_uring,
-    /// Completion-based Overlapped I/O API for Windows.
+    /// Completion-based Overlapped I/O API of Windows.
     iocp,
 };
 
