@@ -72,7 +72,7 @@ pub fn Loop(comptime options: Options) type {
         const Self = @This();
         /// io_uring instance
         ring: IO_Uring,
-        /// io operations that're not queued yet
+        /// I/O operations that're not queued yet
         unqueued: Intrusive(Completion) = .{},
         /// count of I/O operations that we're waiting to be done
         io_pending: u64 = 0,
@@ -105,11 +105,15 @@ pub fn Loop(comptime options: Options) type {
             self.ring.deinit();
         }
 
+        /// TODO: add `tick` function
         /// Runs the event loop 'till all submitted operations are completed.
         pub fn run(self: *Self) !void {
             while (self.io_pending > 0 and self.unqueued.isEmpty()) {
                 // Flush any queued SQEs and reuse the same syscall to wait for completions if required:
                 try self.flushSubmissions();
+
+                // NOTE: SQE array might not be empty as stated in the bottom since we've changed the way loop works.
+                // We don't run `flushCompletions` in `flushSubmissions` to create space anymore.
 
                 // The SQE array is empty from flushSubmissions(). Fill it up with unqueued completions.
                 // This runs before `self.completed` is flushed below to prevent new IO from reserving SQE
@@ -135,14 +139,16 @@ pub fn Loop(comptime options: Options) type {
                     else => return err,
                 };
 
-                // decrement as much as completed events
+                // Decrement as much as completed events.
+                // Currently, `io_pending` is only decremented here.
                 self.io_pending -= completed;
 
                 for (cqes[0..completed]) |*cqe| {
                     const c: *Completion = @ptrFromInt(cqe.user_data);
-                    // FIXME: Passing a copy might be better here
+                    // NOTE: Passing a pointer is okay as long as CQEs are not accessed after this function
+                    // since we're not heap-allocate `cqes`. It'll be vanished after this function returns.
                     c.cqe = cqe;
-
+                    // Execute the completion
                     c.callback(self, c);
                 }
 
@@ -1077,6 +1083,7 @@ pub fn Loop(comptime options: Options) type {
                     socket: linux.fd_t,
                     addr: std.net.Address,
                 },
+                // TODO: take `*posix.sockaddr` instead
                 accept: struct {
                     socket: linux.fd_t, // listener socket
                     addr: posix.sockaddr = undefined,
@@ -1091,8 +1098,6 @@ pub fn Loop(comptime options: Options) type {
                 cancel: Cancel,
                 fds_update: FdsUpdate,
                 close: linux.fd_t,
-                // used for waking up the event loop by sending a message.
-                //message: [16]u8,
             };
 
             // Returns the result of this completion.
