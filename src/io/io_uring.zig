@@ -105,12 +105,39 @@ pub fn Loop(comptime options: Options) type {
             self.ring.deinit();
         }
 
+        /// NOTE: experimental
+        pub fn hasIo(self: *const Self) bool {
+            return self.io_pending > 0 and self.unqueued.isEmpty();
+        }
+
+        /// TODO: accept `wait_nr` as an argument.
+        /// Runs the event loop once.
+        pub fn tick(self: *Self) !void {
+            // Flush any queued SQEs
+            try self.flushSubmissions(1);
+
+            // NOTE: SQE array might not be empty as stated in the bottom since we've changed the way loop works.
+            // We don't run `flushCompletions` in `flushSubmissions` to create space anymore.
+
+            // The SQE array is empty from flushSubmissions(). Fill it up with unqueued completions.
+            // This runs before `self.completed` is flushed below to prevent new IO from reserving SQE
+            // slots and potentially starving those in `self.unqueued`.
+            // Loop over a copy to avoid an infinite loop of `enqueue()` re-adding to `self.unqueued`.
+            {
+                var copy = self.unqueued;
+                self.unqueued = .{};
+                while (copy.pop()) |c| self.enqueue(c);
+            }
+
+            try self.flushCompletions(0);
+        }
+
         /// TODO: add `tick` function
         /// Runs the event loop 'till all submitted operations are completed.
         pub fn run(self: *Self) !void {
             while (self.io_pending > 0 and self.unqueued.isEmpty()) {
                 // Flush any queued SQEs and reuse the same syscall to wait for completions if required:
-                try self.flushSubmissions();
+                try self.flushSubmissions(0);
 
                 // NOTE: SQE array might not be empty as stated in the bottom since we've changed the way loop works.
                 // We don't run `flushCompletions` in `flushSubmissions` to create space anymore.
@@ -126,18 +153,25 @@ pub fn Loop(comptime options: Options) type {
                 }
 
                 // Execute completed CQEs
-                try self.flushCompletions();
+                try self.flushCompletions(0);
             }
         }
 
-        fn flushCompletions(self: *Self) !void {
+        fn flushCompletions(self: *Self, wait_nr: u32) !void {
             var cqes: [512]io_uring_cqe = undefined;
+            var wait_remaining = wait_nr;
 
             while (true) {
-                const completed = self.ring.copy_cqes(&cqes, 1) catch |err| switch (err) {
+                const completed = self.ring.copy_cqes(&cqes, wait_remaining) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
                     else => return err,
                 };
+
+                if (completed > wait_remaining) {
+                    wait_remaining = 0;
+                } else {
+                    wait_remaining -= completed;
+                }
 
                 // Decrement as much as completed events.
                 // Currently, `io_pending` is only decremented here.
@@ -152,14 +186,14 @@ pub fn Loop(comptime options: Options) type {
                     c.callback(self, c);
                 }
 
-                break;
+                if (completed < cqes.len) break;
             }
         }
 
-        fn flushSubmissions(self: *Self) !void {
+        fn flushSubmissions(self: *Self, wait_nr: u32) !void {
             while (true) {
                 // don't decrement the pending count here, we'll take care of it after calling copy_cqes.
-                _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
                     // interrupted, try again
                     error.SignalInterrupt => continue,
                     // there aren't available slots, don't retry and let the `flushCompletions` create some slots

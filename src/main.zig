@@ -121,7 +121,10 @@ pub fn main() !void {
 
     fiber.switchTo();
 
-    try loop1.run();
+    //try loop1.run();
+    while (loop1.hasIo()) {
+        try loop1.tick();
+    }
 }
 
 //pub fn main() !void {
