@@ -74,8 +74,6 @@ pub fn Loop(comptime options: Options) type {
         ring: IO_Uring,
         /// io operations that're not queued yet
         unqueued: Intrusive(Completion) = .{},
-        /// io operations that're completed and ready to fly
-        completed: Intrusive(Completion) = .{},
         /// count of I/O operations that we're waiting to be done
         io_pending: u64 = 0,
 
@@ -112,8 +110,6 @@ pub fn Loop(comptime options: Options) type {
             while (self.io_pending > 0 and self.unqueued.isEmpty()) {
                 // Flush any queued SQEs and reuse the same syscall to wait for completions if required:
                 try self.flushSubmissions();
-                // We can now just peek for any CQEs without waiting and without another syscall:
-                try self.flushCompletions();
 
                 // The SQE array is empty from flushSubmissions(). Fill it up with unqueued completions.
                 // This runs before `self.completed` is flushed below to prevent new IO from reserving SQE
@@ -125,14 +121,14 @@ pub fn Loop(comptime options: Options) type {
                     while (copy.pop()) |c| self.enqueue(c);
                 }
 
-                while (self.completed.pop()) |c| {
-                    c.callback(self, c);
-                }
+                // Execute completed CQEs
+                try self.flushCompletions();
             }
         }
 
         fn flushCompletions(self: *Self) !void {
             var cqes: [512]io_uring_cqe = undefined;
+
             while (true) {
                 const completed = self.ring.copy_cqes(&cqes, 1) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
@@ -147,11 +143,7 @@ pub fn Loop(comptime options: Options) type {
                     // FIXME: Passing a copy might be better here
                     c.cqe = cqe;
 
-                    // We do not run the completion here (instead appending to a linked list) to avoid:
-                    // * recursion through `flush_submissions()` and `flush_completions()`,
-                    // * unbounded stack usage, and
-                    // * confusing stack traces.
-                    self.completed.push(c);
+                    c.callback(self, c);
                 }
 
                 break;
@@ -162,12 +154,10 @@ pub fn Loop(comptime options: Options) type {
             while (true) {
                 // don't decrement the pending count here, we'll take care of it after calling copy_cqes.
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                    // interrupted, try again
                     error.SignalInterrupt => continue,
-                    error.CompletionQueueOvercommitted, error.SystemResources => {
-                        // flush completions to create space
-                        try self.flushCompletions();
-                        continue;
-                    },
+                    // there aren't available slots, don't retry and let the `flushCompletions` create some slots
+                    error.CompletionQueueOvercommitted => {},
                     else => return err,
                 };
 
@@ -296,23 +286,6 @@ pub fn Loop(comptime options: Options) type {
 
             // we got a pending io
             self.io_pending += 1;
-        }
-
-        pub fn message(self: *Self, completion: *Completion) void {
-            completion.* = .{
-                .next = null,
-                .operation = .none,
-                .userdata = null,
-                .callback = comptime struct {
-                    fn wrap(_: *Self, _: *Completion) void {
-                        std.debug.print("done\n", .{});
-                    }
-                }.wrap,
-            };
-
-            // push directly to completed to run on next iteration
-            self.io_pending += 1;
-            self.completed.push(completion);
         }
 
         pub const ReadError = anyerror;
