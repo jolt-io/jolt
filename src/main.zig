@@ -9,16 +9,136 @@ const BufferPool = @import("buffer_pool.zig").BufferPool(.io_uring);
 
 const allocator = std.heap.page_allocator;
 
+const Fiber = @import("fiber.zig");
+
 const DefaultLoop = Loop(.{
     .io_uring = .{
-        .direct_descriptors_mode = true,
-        .buffer_pool_mode = true,
+        .direct_descriptors_mode = false,
+        .buffer_pool_mode = false,
     },
 });
 
 const Completion = DefaultLoop.Completion;
 
+threadlocal var loop1: DefaultLoop = undefined;
+
+pub const tcp = struct {
+    pub fn connect(c: *Completion, socket: linux.fd_t, addr: std.net.Address) !*Completion {
+        // request a connect operation
+        loop1.connect(Fiber, Fiber.current().?, c, socket, addr, invoker);
+        // stop the execution of the calling fiber
+        Fiber.yield();
+
+        // when we got here, operation is finished
+
+        return c;
+    }
+
+    pub fn write(c: *Completion, socket: linux.fd_t, buffer: []const u8) !*Completion {
+        loop1.send(c, Fiber, Fiber.current().?, socket, buffer, onSend1);
+
+        Fiber.yield();
+
+        return c;
+    }
+
+    pub fn read(c: *Completion, socket: linux.fd_t, buffer: []u8) !*Completion {
+        loop1.recv(c, Fiber, Fiber.current().?, socket, buffer, onRecv1);
+
+        Fiber.yield();
+
+        return c;
+    }
+};
+
+fn invoker(fiber: *Fiber, _: *DefaultLoop, _: *Completion) void {
+    // requested operation has finished, resume the fiber back
+    fiber.switchTo();
+
+    // it means fiber has completed when we got here
+}
+
+fn onSend1(
+    fiber: *Fiber,
+    loop: *DefaultLoop,
+    completion: *Completion,
+    buffer: []const u8,
+    /// u31 is preferred for coercion
+    result: DefaultLoop.SendError!u31,
+) void {
+    _ = loop;
+    _ = completion;
+    _ = buffer;
+    _ = result catch unreachable;
+
+    fiber.switchTo();
+}
+
+fn onRecv1(
+    fiber: *Fiber,
+    loop: *DefaultLoop,
+    completion: *Completion,
+    socket: linux.fd_t,
+    buffer: []u8,
+    /// u31 is preferred for coercion
+    result: DefaultLoop.RecvError!u31,
+) void {
+    _ = loop;
+    _ = completion;
+    _ = socket;
+    _ = buffer;
+    _ = result catch unreachable;
+
+    fiber.switchTo();
+}
+
+fn fiberFn(ip: []const u8) void {
+    const socket = posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
+    defer posix.close(socket);
+
+    const addr = std.net.Address.parseIp(ip, 80) catch unreachable;
+
+    var c = Completion{};
+    _ = tcp.connect(&c, socket, addr) catch unreachable;
+
+    _ = tcp.write(&c, socket, "GET / HTTP/1.1\r\n\r\n") catch unreachable;
+
+    var buffer: [1024]u8 = undefined;
+    const recv_c = tcp.read(&c, socket, &buffer) catch unreachable;
+    const len: u31 = @intCast(recv_c.cqe.?.res);
+
+    std.debug.print("{s}\n", .{buffer[0..len]});
+}
+
 pub fn main() !void {
+    loop1 = try DefaultLoop.init();
+    defer loop1.deinit();
+
+    const stack = try allocator.alignedAlloc(u8, Fiber.stack_alignment, 16 * 1024);
+    defer allocator.free(stack);
+
+    const fiber = try Fiber.init(stack, 0x0, fiberFn, .{"142.250.187.174"});
+
+    fiber.switchTo();
+
+    try loop1.run();
+}
+
+//pub fn main() !void {
+//    const socket = try jolt.tcp.init();
+//
+//    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
+//    try socket.bind(addr);
+//    try socket.listen(128);
+//
+//    while (true) {
+//        const client = try socket.accept();
+//    }
+//
+//    std.debug.print("{s}\n", .{buf[0..len]});
+//}
+
+pub fn main2() !void {
     var loop = try DefaultLoop.init();
     defer loop.deinit();
 

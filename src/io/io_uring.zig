@@ -76,7 +76,7 @@ pub fn Loop(comptime options: Options) type {
         unqueued: Intrusive(Completion) = .{},
         /// io operations that're completed and ready to fly
         completed: Intrusive(Completion) = .{},
-        /// count of operations that we're waiting to be done
+        /// count of I/O operations that we're waiting to be done
         io_pending: u64 = 0,
 
         /// TODO: Check io_uring capabilities of kernel.
@@ -296,6 +296,23 @@ pub fn Loop(comptime options: Options) type {
 
             // we got a pending io
             self.io_pending += 1;
+        }
+
+        pub fn message(self: *Self, completion: *Completion) void {
+            completion.* = .{
+                .next = null,
+                .operation = .none,
+                .userdata = null,
+                .callback = comptime struct {
+                    fn wrap(_: *Self, _: *Completion) void {
+                        std.debug.print("done\n", .{});
+                    }
+                }.wrap,
+            };
+
+            // push directly to completed to run on next iteration
+            self.io_pending += 1;
+            self.completed.push(completion);
         }
 
         pub const ReadError = anyerror;
@@ -825,6 +842,8 @@ pub fn Loop(comptime options: Options) type {
                         const cqe = c.cqe.?;
                         const res = cqe.res;
 
+                        // According to Zen, close operations should not fail.
+                        // So we do not return any errors here.
                         switch (@as(posix.E, @enumFromInt(-res))) {
                             .BADF => unreachable, // Always a race condition.
                             .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
@@ -1099,7 +1118,15 @@ pub fn Loop(comptime options: Options) type {
                 cancel: Cancel,
                 fds_update: FdsUpdate,
                 close: linux.fd_t,
+                // used for waking up the event loop by sending a message.
+                //message: [16]u8,
             };
+
+            // Returns the result of this completion.
+            //pub fn getResult(comptime op_type: OperationType) switch (op_type) {
+            //    .read => ReadError!u31,
+            //    else => void,
+            //} {}
         };
     };
 }
