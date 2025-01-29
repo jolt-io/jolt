@@ -9,8 +9,6 @@ const BufferPool = @import("buffer_pool.zig").BufferPool(.io_uring);
 
 const allocator = std.heap.page_allocator;
 
-const Fiber = @import("fiber.zig");
-
 const DefaultLoop = Loop(.{
     .io_uring = .{
         .direct_descriptors_mode = false,
@@ -19,47 +17,46 @@ const DefaultLoop = Loop(.{
 });
 
 const Completion = DefaultLoop.Completion;
+const Fiber = @import("fiber.zig").Fiber(Completion);
 
 threadlocal var loop1: DefaultLoop = undefined;
 
 pub const tcp = struct {
-    pub fn connect(c: *Completion, socket: linux.fd_t, addr: std.net.Address) !*Completion {
+    pub fn connect(socket: linux.fd_t, addr: std.net.Address) !void {
         // request a connect operation
-        loop1.connect(Fiber, Fiber.current().?, c, socket, addr, invoker);
+        loop1.connect(Fiber, Fiber.current().?, Fiber.completion(), socket, addr, invoker);
         // stop the execution of the calling fiber
         Fiber.yield();
 
         // when we got here, operation is finished
 
-        return c;
+        return;
     }
 
-    pub fn write(c: *Completion, socket: linux.fd_t, buffer: []const u8) !*Completion {
-        loop1.send(c, Fiber, Fiber.current().?, socket, buffer, onSend1);
+    pub fn write(socket: linux.fd_t, buffer: []const u8) !void {
+        loop1.send(Fiber.completion(), Fiber, Fiber.current().?, socket, buffer, onSend1);
 
         Fiber.yield();
 
-        return c;
+        return;
     }
 
-    pub fn read(c: *Completion, socket: linux.fd_t, buffer: []u8) !*Completion {
-        loop1.recv(c, Fiber, Fiber.current().?, socket, buffer, onRecv1);
+    pub fn read(socket: linux.fd_t, buffer: []u8) !void {
+        loop1.recv(Fiber.completion(), Fiber, Fiber.current().?, socket, buffer, onRecv1);
 
         Fiber.yield();
 
-        return c;
+        return;
     }
 };
 
-fn invoker(fiber: *Fiber, _: *DefaultLoop, _: *Completion) void {
+fn invoker(state: *Fiber, _: *DefaultLoop, _: *Completion) void {
     // requested operation has finished, resume the fiber back
-    fiber.switchTo();
-
-    // it means fiber has completed when we got here
+    Fiber.switchTo(state);
 }
 
 fn onSend1(
-    fiber: *Fiber,
+    state: *Fiber,
     loop: *DefaultLoop,
     completion: *Completion,
     buffer: []const u8,
@@ -71,11 +68,11 @@ fn onSend1(
     _ = buffer;
     _ = result catch unreachable;
 
-    fiber.switchTo();
+    Fiber.switchTo(state);
 }
 
 fn onRecv1(
-    fiber: *Fiber,
+    state: *Fiber,
     loop: *DefaultLoop,
     completion: *Completion,
     socket: linux.fd_t,
@@ -89,7 +86,7 @@ fn onRecv1(
     _ = buffer;
     _ = result catch unreachable;
 
-    fiber.switchTo();
+    Fiber.switchTo(state);
 }
 
 fn fiberFn(ip: []const u8) void {
@@ -98,16 +95,14 @@ fn fiberFn(ip: []const u8) void {
 
     const addr = std.net.Address.parseIp(ip, 80) catch unreachable;
 
-    var c = Completion{};
-    _ = tcp.connect(&c, socket, addr) catch unreachable;
+    _ = tcp.connect(socket, addr) catch unreachable;
 
-    _ = tcp.write(&c, socket, "GET / HTTP/1.1\r\n\r\n") catch unreachable;
+    _ = tcp.write(socket, "GET / HTTP/1.1\r\n\r\n") catch unreachable;
 
     var buffer: [1024]u8 = undefined;
-    const recv_c = tcp.read(&c, socket, &buffer) catch unreachable;
-    const len: u31 = @intCast(recv_c.cqe.?.res);
+    tcp.read(socket, &buffer) catch unreachable;
 
-    std.debug.print("{s}\n", .{buffer[0..len]});
+    std.debug.print("{s}\n", .{buffer[0..]});
 }
 
 pub fn main() !void {
@@ -117,13 +112,12 @@ pub fn main() !void {
     const stack = try allocator.alignedAlloc(u8, Fiber.stack_alignment, 16 * 1024);
     defer allocator.free(stack);
 
-    const fiber = try Fiber.init(stack, 0x0, fiberFn, .{"142.250.187.174"});
+    const state = try Fiber.init(stack, fiberFn, .{"142.250.187.174"});
 
-    fiber.switchTo();
+    Fiber.switchTo(state);
 
-    //try loop1.run();
     while (loop1.hasIo()) {
-        try loop1.tick();
+        try loop1.tick(1);
     }
 }
 

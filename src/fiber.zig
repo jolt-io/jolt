@@ -27,12 +27,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 
-pub fn Fiber(comptime CompletionType: type) type {
-    _ = CompletionType;
-
+pub fn Fiber(comptime Completion: type) type {
     return extern struct {
         caller_context: *anyopaque,
         stack_context: *anyopaque,
+        completion_ptr: *Completion,
 
         pub const stack_alignment = 16;
         pub const Stack = []align(stack_alignment) u8;
@@ -58,6 +57,13 @@ pub fn Fiber(comptime CompletionType: type) type {
             stack_ptr = std.mem.alignBackward(usize, stack_ptr - args_size, stack_alignment);
             if (stack_ptr < stack_base) return error.StackTooSmall;
 
+            // FIXME: is this the right way to do this?
+            // Push the completion to the stack.
+            stack_ptr = std.mem.alignBackward(usize, stack_ptr - @sizeOf(Completion), stack_alignment);
+            if (stack_ptr < stack_base) return error.StackTooSmall;
+
+            const completion_ptr: *Completion = @ptrFromInt(stack_ptr);
+
             // Reserve data for the StackContext.
             stack_ptr = std.mem.alignBackward(usize, stack_ptr - @sizeOf(usize) * StackContext.word_count, stack_alignment);
             assert(std.mem.isAligned(stack_ptr, stack_alignment));
@@ -70,6 +76,7 @@ pub fn Fiber(comptime CompletionType: type) type {
             state.* = .{
                 .caller_context = undefined,
                 .stack_context = @ptrFromInt(stack_ptr),
+                .completion_ptr = completion_ptr,
             };
 
             return state;
@@ -106,6 +113,12 @@ pub fn Fiber(comptime CompletionType: type) type {
             return tls_state;
         }
 
+        /// Returns the completion which is allocated in the fiber's stack.
+        pub fn completion() *Completion {
+            const state = tls_state orelse @panic("can only be used in a fiber");
+            return state.completion_ptr;
+        }
+
         /// Switches the current thread's execution state from the caller's to the fiber's.
         /// The fiber will return back to this caller either through yield or completing its init function.
         /// The fiber must either be newly initialized or previously yielded.
@@ -127,7 +140,7 @@ pub fn Fiber(comptime CompletionType: type) type {
         /// Once execution is yielded back, switchTo() on the (now previous) current fiber can be called again
         /// to continue the fiber from this yield point.
         pub fn yield() void {
-            const state = tls_state orelse @panic("can't yield from non-fiber");
+            const state = tls_state orelse @panic("can only be used in a fiber");
             zefi_stack_swap(&state.stack_context, &state.caller_context);
         }
     };
