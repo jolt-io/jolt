@@ -106,15 +106,14 @@ pub fn Loop(comptime options: Options) type {
         }
 
         /// NOTE: experimental
-        pub fn hasIo(self: *const Self) bool {
+        pub inline fn hasIo(self: *const Self) bool {
             return self.io_pending > 0 and self.unqueued.isEmpty();
         }
 
-        /// TODO: accept `wait_nr` as an argument.
-        /// Runs the event loop once.
-        pub fn tick(self: *Self) !void {
+        /// Runs the event loop 'till completing `wait_nr` events.
+        pub fn tick(self: *Self, wait_nr: u32) !void {
             // Flush any queued SQEs
-            try self.flushSubmissions(1);
+            try self.flushSubmissions(wait_nr);
 
             // NOTE: SQE array might not be empty as stated in the bottom since we've changed the way loop works.
             // We don't run `flushCompletions` in `flushSubmissions` to create space anymore.
@@ -129,32 +128,7 @@ pub fn Loop(comptime options: Options) type {
                 while (copy.pop()) |c| self.enqueue(c);
             }
 
-            try self.flushCompletions(0);
-        }
-
-        /// TODO: add `tick` function
-        /// Runs the event loop 'till all submitted operations are completed.
-        pub fn run(self: *Self) !void {
-            while (self.io_pending > 0 and self.unqueued.isEmpty()) {
-                // Flush any queued SQEs and reuse the same syscall to wait for completions if required:
-                try self.flushSubmissions(0);
-
-                // NOTE: SQE array might not be empty as stated in the bottom since we've changed the way loop works.
-                // We don't run `flushCompletions` in `flushSubmissions` to create space anymore.
-
-                // The SQE array is empty from flushSubmissions(). Fill it up with unqueued completions.
-                // This runs before `self.completed` is flushed below to prevent new IO from reserving SQE
-                // slots and potentially starving those in `self.unqueued`.
-                // Loop over a copy to avoid an infinite loop of `enqueue()` re-adding to `self.unqueued`.
-                {
-                    var copy = self.unqueued;
-                    self.unqueued = .{};
-                    while (copy.pop()) |c| self.enqueue(c);
-                }
-
-                // Execute completed CQEs
-                try self.flushCompletions(0);
-            }
+            try self.flushCompletions(wait_nr);
         }
 
         fn flushCompletions(self: *Self, wait_nr: u32) !void {
