@@ -1,3 +1,4 @@
+/// Which backend to use for I/O related tasks.
 pub const IoEngine = enum {
     /// Modern asynchronous I/O API of Linux.
     io_uring,
