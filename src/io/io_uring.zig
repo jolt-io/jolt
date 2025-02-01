@@ -115,6 +115,8 @@ pub fn Loop(comptime options: Options) type {
 
                 return completed;
             }
+
+            unreachable;
         }
 
         /// Registers a completion to the loop.
