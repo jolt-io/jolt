@@ -60,6 +60,7 @@ pub fn Loop(comptime options: Options) type {
             return self.io_pending > 0 and self.unqueued.isEmpty();
         }
 
+        /// Runs the event loop until all operations are completed.
         pub fn run(self: *Self) !void {
             var cqes: [512]io_uring_cqe = undefined;
 
@@ -67,45 +68,32 @@ pub fn Loop(comptime options: Options) type {
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
                     // interrupted, try again
                     error.SignalInterrupt => continue,
-                    // there aren't available slots, let's flush completions and create space for the next run
-                    error.CompletionQueueOvercommitted, error.SystemResources => {
-                        // flush completions now
-                        const completed = try self.flushCompletions(&cqes);
-
-                        // we likely have space
-                        self.resubmit();
-
-                        // run the completions!
-                        self.runCompletions(cqes[0..completed]);
-
-                        // this run has completed
-                        continue;
-                    },
+                    // we'll flush completions right after
+                    error.CompletionQueueOvercommitted => {},
                     else => return err,
                 };
 
-                // since we've just submitted, we can retry to queue
-                self.resubmit();
-
-                // flush the completions right after
-                const completed = try self.flushCompletions(&cqes);
-
-                // run the completions!
-                self.runCompletions(cqes[0..completed]);
+                try self.flush(&cqes);
             }
         }
 
-        /// Retries queueing completions that're unable to be queued before.
-        fn resubmit(self: *Self) void {
-            var copy = self.unqueued;
-            self.unqueued = .{};
-            while (copy.pop()) |c| self.enqueue(c);
-        }
+        /// This function does 3 things in a single call;
+        /// * Flushes completions,
+        /// * Retries submitting unqueued completions,
+        /// * Runs the callbacks of completed completions.
+        fn flush(self: *Self, slice: []io_uring_cqe) !void {
+            // start by flushing completions that're queued
+            const completed = try self.flushCompletions(slice);
 
-        /// Runs the completion callbacks of a slice of CQEs.
-        fn runCompletions(self: *Self, slice: []io_uring_cqe) void {
-            // copy cqes and execute their callbacks
-            for (slice) |*cqe| {
+            // Retry queueing completions that're unable to be queued before
+            {
+                var copy = self.unqueued;
+                self.unqueued = .{};
+                while (copy.pop()) |c| self.enqueue(c);
+            }
+
+            // run completions
+            for (slice[0..completed]) |*cqe| {
                 const c: *Completion = @ptrFromInt(cqe.user_data);
                 // FIXME: I'm not sure passing a pointer here is okay
                 c.cqe = cqe;
