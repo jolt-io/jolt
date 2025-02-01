@@ -13,57 +13,7 @@ const io_uring_sqe = linux.io_uring_sqe;
 const Intrusive = @import("../queue.zig").Intrusive;
 const Options = @import("options.zig").Options;
 const BufferPool = @import("../buffer_pool.zig").BufferPool(.io_uring);
-
-/// TODO: add support for this in zig std.
-inline fn io_uring_prep_cancel_fd(sqe: *io_uring_sqe, fd: linux.fd_t, flags: u32) void {
-    sqe.prep_rw(.ASYNC_CANCEL, fd, 0, 0, 0);
-    sqe.rw_flags = flags | linux.IORING_ASYNC_CANCEL_FD;
-}
-
-/// TODO: add support for this in zig std.
-inline fn io_uring_prep_files_update(sqe: *io_uring_sqe, fds: []const linux.fd_t, offset: u32) void {
-    sqe.prep_rw(.FILES_UPDATE, -1, @intFromPtr(fds.ptr), fds.len, @intCast(offset));
-}
-
-/// TODO: add support for this in zig std.
-/// FIXME: implementation here doesn't match with liburing, might want to change that.
-/// https://github.com/axboe/liburing/blob/76bb80a36107e3808c4770c8112583813a4e511b/src/register.c#L139
-fn io_uring_register_files_sparse(ring: *IO_Uring, nr: u32) !void {
-    const reg = &linux.io_uring_rsrc_register{
-        .nr = nr,
-        .flags = linux.IORING_RSRC_REGISTER_SPARSE,
-        .resv2 = 0,
-        .data = 0,
-        .tags = 0,
-    };
-
-    const res = linux.io_uring_register(
-        ring.fd,
-        .REGISTER_FILES2,
-        @ptrCast(reg),
-        @as(u32, @sizeOf(linux.io_uring_rsrc_register)),
-    );
-
-    return switch (linux.E.init(res)) {
-        .SUCCESS => {},
-        // One or more fds in the array are invalid, or the kernel does not support sparse sets:
-        .BADF => error.FileDescriptorInvalid,
-        .BUSY => error.FilesAlreadyRegistered,
-        .INVAL => error.FilesEmpty,
-        // Adding `nr_args` file references would exceed the maximum allowed number of files the
-        // user is allowed to have according to the per-user RLIMIT_NOFILE resource limit and
-        // the CAP_SYS_RESOURCE capability is not set, or `nr_args` exceeds the maximum allowed
-        // for a fixed file set (older kernels have a limit of 1024 files vs 64K files):
-        .MFILE => error.UserFdQuotaExceeded,
-        // Insufficient kernel resources, or the caller had a non-zero RLIMIT_MEMLOCK soft
-        // resource limit but tried to lock more memory than the limit permitted (not enforced
-        // when the process is privileged with CAP_IPC_LOCK):
-        .NOMEM => error.SystemResources,
-        // Attempt to register files on a ring already registering files or being torn down:
-        .NXIO => error.RingShuttingDownOrAlreadyRegisteringFiles,
-        else => |errno| posix.unexpectedErrno(errno),
-    };
-}
+const ex = @import("linux/io_uring_ex.zig");
 
 /// Event notifier implementation based on io_uring.
 /// FIXME: Add error types
@@ -110,72 +60,72 @@ pub fn Loop(comptime options: Options) type {
             return self.io_pending > 0 and self.unqueued.isEmpty();
         }
 
-        /// Runs the event loop 'till completing `wait_nr` events.
-        pub fn tick(self: *Self, wait_nr: u32) !void {
-            // Flush any queued SQEs
-            try self.flushSubmissions(wait_nr);
-
-            // NOTE: SQE array might not be empty as stated in the bottom since we've changed the way loop works.
-            // We don't run `flushCompletions` in `flushSubmissions` to create space anymore.
-
-            // The SQE array is empty from flushSubmissions(). Fill it up with unqueued completions.
-            // This runs before `self.completed` is flushed below to prevent new IO from reserving SQE
-            // slots and potentially starving those in `self.unqueued`.
-            // Loop over a copy to avoid an infinite loop of `enqueue()` re-adding to `self.unqueued`.
-            {
-                var copy = self.unqueued;
-                self.unqueued = .{};
-                while (copy.pop()) |c| self.enqueue(c);
-            }
-
-            try self.flushCompletions(wait_nr);
-        }
-
-        fn flushCompletions(self: *Self, wait_nr: u32) !void {
+        pub fn run(self: *Self) !void {
             var cqes: [512]io_uring_cqe = undefined;
-            var wait_remaining = wait_nr;
 
-            while (true) {
-                const completed = self.ring.copy_cqes(&cqes, wait_remaining) catch |err| switch (err) {
+            while (self.hasIo()) {
+                _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                    // interrupted, try again
                     error.SignalInterrupt => continue,
+                    // there aren't available slots, let's flush completions and create space for the next run
+                    error.CompletionQueueOvercommitted, error.SystemResources => {
+                        // flush completions now
+                        const completed = try self.flushCompletions(&cqes);
+
+                        // we likely have space
+                        self.resubmit();
+
+                        // run the completions!
+                        self.runCompletions(cqes[0..completed]);
+
+                        // this run has completed
+                        continue;
+                    },
                     else => return err,
                 };
 
-                if (completed > wait_remaining) {
-                    wait_remaining = 0;
-                } else {
-                    wait_remaining -= completed;
-                }
+                // since we've just submitted, we can retry to queue
+                self.resubmit();
+
+                // flush the completions right after
+                const completed = try self.flushCompletions(&cqes);
+
+                // run the completions!
+                self.runCompletions(cqes[0..completed]);
+            }
+        }
+
+        /// Retries queueing completions that're unable to be queued before.
+        fn resubmit(self: *Self) void {
+            var copy = self.unqueued;
+            self.unqueued = .{};
+            while (copy.pop()) |c| self.enqueue(c);
+        }
+
+        /// Runs the completion callbacks of a slice of CQEs.
+        fn runCompletions(self: *Self, slice: []io_uring_cqe) void {
+            // copy cqes and execute their callbacks
+            for (slice) |*cqe| {
+                const c: *Completion = @ptrFromInt(cqe.user_data);
+                // FIXME: I'm not sure passing a pointer here is okay
+                c.cqe = cqe;
+                // Execute the completion
+                c.callback(self, c);
+            }
+        }
+
+        fn flushCompletions(self: *Self, slice: []io_uring_cqe) !u32 {
+            while (true) {
+                const completed = self.ring.copy_cqes(slice, 1) catch |err| switch (err) {
+                    error.SignalInterrupt => continue,
+                    else => return err,
+                };
 
                 // Decrement as much as completed events.
                 // Currently, `io_pending` is only decremented here.
                 self.io_pending -= completed;
 
-                for (cqes[0..completed]) |*cqe| {
-                    const c: *Completion = @ptrFromInt(cqe.user_data);
-                    // NOTE: Passing a pointer is okay as long as CQEs are not accessed after this function
-                    // since we're not heap-allocate `cqes`. It'll be vanished after this function returns.
-                    c.cqe = cqe;
-                    // Execute the completion
-                    c.callback(self, c);
-                }
-
-                if (completed < cqes.len) break;
-            }
-        }
-
-        fn flushSubmissions(self: *Self, wait_nr: u32) !void {
-            while (true) {
-                // don't decrement the pending count here, we'll take care of it after calling copy_cqes.
-                _ = self.ring.submit_and_wait(wait_nr) catch |err| switch (err) {
-                    // interrupted, try again
-                    error.SignalInterrupt => continue,
-                    // there aren't available slots, don't retry and let the `flushCompletions` create some slots
-                    error.CompletionQueueOvercommitted => {},
-                    else => return err,
-                };
-
-                break;
+                return completed;
             }
         }
 
@@ -262,7 +212,7 @@ pub fn Loop(comptime options: Options) type {
                 // FIXME: IORING_TIMEOUT_ETIME_SUCCESS seems to have no effect here
                 .timeout => |*ts| sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS),
                 .cancel => |op| switch (op) {
-                    .all_io => |fd| io_uring_prep_cancel_fd(sqe, fd, linux.IORING_ASYNC_CANCEL_ALL),
+                    .all_io => |fd| ex.io_uring_prep_cancel_fd(sqe, fd, linux.IORING_ASYNC_CANCEL_ALL),
                     .completion => |comp| {
                         if (comp.operation == .timeout) {
                             // prepare a timeout removal instead
@@ -273,7 +223,7 @@ pub fn Loop(comptime options: Options) type {
                     },
                 },
                 .fds_update => |op| switch (comptime options.io_uring.direct_descriptors_mode) {
-                    true => io_uring_prep_files_update(sqe, op.fds, op.offset),
+                    true => ex.io_uring_prep_files_update(sqe, op.fds, op.offset),
                     false => unreachable,
                 },
                 .close => |fd| {
@@ -866,7 +816,7 @@ pub fn Loop(comptime options: Options) type {
 
             return switch (registration) {
                 .regular => self.ring.register_files(array_or_u32),
-                .sparse => io_uring_register_files_sparse(&self.ring, array_or_u32),
+                .sparse => ex.io_uring_register_files_sparse(&self.ring, array_or_u32),
             };
         }
 
@@ -1038,6 +988,18 @@ pub fn Loop(comptime options: Options) type {
                 cancel,
                 fds_update,
                 close,
+
+                /// Returns the return type for the given operation type.
+                /// Can be run on comptime, but not necessarily.
+                pub fn returns(op: OperationType) type {
+                    return switch (op) {
+                        .connect => anyerror!void,
+                        .read => ReadError!u31,
+                        .recv => RecvError!usize,
+                        .send => SendError!usize,
+                        inline else => unreachable,
+                    };
+                }
             };
 
             // values needed by operations
@@ -1109,10 +1071,73 @@ pub fn Loop(comptime options: Options) type {
             };
 
             // Returns the result of this completion.
-            //pub fn getResult(comptime op_type: OperationType) switch (op_type) {
-            //    .read => ReadError!u31,
-            //    else => void,
-            //} {}
+            pub fn getResult(completion: *Completion, comptime op_type: OperationType) op_type.returns() {
+                const cqe = completion.cqe.?;
+                const res = cqe.res;
+
+                switch (comptime op_type) {
+                    .send => {
+                        if (res < 0) {
+                            return switch (@as(posix.E, @enumFromInt(-res))) {
+                                .INTR => unreachable, // TODO: this used to enqueue the completion again
+                                .ACCES => error.AccessDenied,
+                                .AGAIN => error.WouldBlock,
+                                .ALREADY => error.FastOpenAlreadyInProgress,
+                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .DESTADDRREQ => unreachable,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .ISCONN => unreachable,
+                                .MSGSIZE => error.MessageTooBig,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .PIPE => error.BrokenPipe,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                .CANCELED => error.Cancelled,
+                                else => |err| posix.unexpectedErrno(err),
+                            };
+                        } else {
+                            // valid length
+                            return @intCast(res);
+                        }
+                    },
+                    .recv => {
+                        // are you friend or foe
+                        if (res <= 0) {
+                            return switch (@as(posix.E, @enumFromInt(-res))) {
+                                .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
+                                //.INTR => return loop.enqueue(c), // we're interrupted, try again
+                                .INTR => unreachable,
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.Unexpected,
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .NOBUFS => if (options.io_uring.buffer_pool_mode) error.OutOfBuffers else error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.Unexpected,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .CANCELED => error.Cancelled,
+                                else => error.Unexpected,
+                            };
+                        } else {
+                            // valid length
+                            return @intCast(res);
+                        }
+                    },
+                    inline else => unreachable,
+                }
+
+                unreachable;
+            }
         };
     };
 }
