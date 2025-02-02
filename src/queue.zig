@@ -14,8 +14,8 @@ const assert = std.debug.assert;
 pub fn Intrusive(comptime T: type) type {
     // check if `next` field exists
     comptime {
-        if (!@hasField(T, "next")) {
-            @compileError("type doesn't include `next` field");
+        if (@FieldType(T, "next") != ?*T) {
+            @compileError("`next` field must be type of `?*T`");
         }
     }
 
