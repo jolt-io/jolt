@@ -68,7 +68,7 @@ pub fn Loop(comptime options: Options) type {
                 _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
                     // interrupted, try again
                     error.SignalInterrupt => continue,
-                    // we'll flush completions right after
+                    // we'll flush completions right after anyway
                     error.CompletionQueueOvercommitted => {},
                     else => return err,
                 };
@@ -166,28 +166,28 @@ pub fn Loop(comptime options: Options) type {
                     false => sqe.prep_multishot_accept(op.socket, &op.addr, &op.addr_size, posix.SOCK.CLOEXEC),
                 },
                 .recv => |op| {
-                    if (comptime options.io_uring.buffer_pool_mode) {
-                        // recv multishot requires everything to be zero since the buffer will be selected automatically
-                        sqe.prep_rw(.RECV, op.socket, 0, 0, 0);
-                        // which buffer group to use, in liburing, field set is `buf_group` but it's actually defined as a union
-                        sqe.buf_index = op.buf_pool.group_id;
-                    } else {
-                        // recv with userspace buffer
-                        sqe.prep_rw(.RECV, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
-                    }
+                    sqe.prep_rw(.RECV, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
                         sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
+                },
+                // recv buffer pool variant
+                .recv_bp => |op| {
+                    // recv multishot requires everything to be zero since the buffer will be selected automatically
+                    sqe.prep_rw(.RECV, op.socket, 0, 0, 0);
+                    // which buffer group to use, in liburing, field set is `buf_group` but it's actually defined as a union
+                    sqe.buf_index = op.buf_pool.group_id;
+                    // indicate that we've selected a buffer group
+                    sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+                    // NOTE: Following flag only works on provided buffers.
+                    // https://github.com/axboe/liburing/issues/1331#issuecomment-2599784984
+                    sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
 
-                    // we want to use buffer pools
-                    if (comptime options.io_uring.buffer_pool_mode) {
-                        // indicate that we've selected a buffer group
-                        sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-                        // NOTE: Following flag only works on provided buffers.
-                        // https://github.com/axboe/liburing/issues/1331#issuecomment-2599784984
-                        sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+                    // we want to use direct descriptors
+                    if (comptime options.io_uring.direct_descriptors_mode) {
+                        sqe.flags |= linux.IOSQE_FIXED_FILE;
                     }
                 },
                 .send => |op| {
@@ -469,10 +469,7 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
-        pub const BufferPoolError = error{OutOfBuffers};
-
-        // shared errors with buffer pool mode
-        pub const RecvMutualError = error{
+        pub const RecvError = error{
             EndOfStream,
             WouldBlock,
             SystemResources,
@@ -484,11 +481,6 @@ pub fn Loop(comptime options: Options) type {
             ConnectionRefused,
         } || CancellationError || UnexpectedError;
 
-        pub const RecvError = switch (options.io_uring.buffer_pool_mode) {
-            true => RecvMutualError || BufferPoolError,
-            false => RecvMutualError,
-        };
-
         /// Queues a recv operation.
         pub fn recv(
             self: *Self,
@@ -496,101 +488,94 @@ pub fn Loop(comptime options: Options) type {
             comptime T: type,
             userdata: *T,
             socket: Socket,
-            buf_pool_or_buffer: switch (options.io_uring.buffer_pool_mode) {
-                true => *BufferPool,
-                false => []u8,
-            },
-            comptime callback: switch (options.io_uring.buffer_pool_mode) {
-                // buffer pool activated
-                true => *const fn (
-                    userdata: *T,
-                    loop: *Self,
-                    completion: *Completion,
-                    socket: Socket,
-                    buffer_pool: *BufferPool,
-                    buffer_id: u16,
-                    /// u31 is preferred for coercion
-                    result: RecvError!u31,
-                ) void,
-                // regular
-                false => *const fn (
-                    userdata: *T,
-                    loop: *Self,
-                    completion: *Completion,
-                    socket: Socket,
-                    buffer: []u8,
-                    /// u31 is preferred for coercion
-                    result: RecvError!u31,
-                ) void,
-            },
+            buffer: []u8,
+            comptime callback: *const fn (
+                userdata: *T,
+                loop: *Self,
+                completion: *Completion,
+                socket: Socket,
+                buffer: []u8,
+            ) void,
         ) void {
             completion.* = .{
                 .next = null,
                 .operation = .{
-                    .recv = switch (comptime options.io_uring.buffer_pool_mode) {
-                        true => .{ .socket = socket, .buf_pool = buf_pool_or_buffer },
-                        false => .{ .socket = socket, .buffer = buf_pool_or_buffer },
+                    .recv = .{
+                        .socket = socket,
+                        .buffer = buffer,
+                    },
+                },
+                .userdata = userdata,
+                .callback = struct {
+                    fn wrap(loop: *Self, c: *Completion) void {
+                        const op = c.operation.recv;
+
+                        // regular buffer version
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer });
+                    }
+                }.wrap,
+            };
+
+            self.enqueue(completion);
+        }
+
+        pub const RecvBufferPoolError = RecvError || error{OutOfBuffers};
+
+        /// NOTE: Experimental.
+        ///
+        /// Queues a recv operation, this variant uses a buffer pool instead of a single buffer.
+        ///
+        /// io_uring supports a mechanism called provided buffers. The application sets
+        /// aside a pool of buffers, and informs io_uring of those buffers. This allows the kernel to
+        /// pick a suitable buffer when the given receive operation is ready to actually receive data,
+        /// rather than upfront. The CQE posted will then additionally hold information about
+        /// which buffer was picked.
+        /// https://kernel.dk/io_uring%20and%20networking%20in%202023.pdf
+        pub fn recvBufferPool(
+            self: *Self,
+            completion: *Completion,
+            comptime T: type,
+            userdata: *T,
+            socket: Socket,
+            buffer_pool: *BufferPool,
+            comptime callback: *const fn (
+                userdata: *T,
+                loop: *Self,
+                completion: *Completion,
+                socket: Socket,
+                buffer_pool: *BufferPool,
+                buffer_id: u16,
+            ) void,
+        ) void {
+            completion.* = .{
+                .next = null,
+                .operation = .{
+                    .recv_bp = .{
+                        .socket = socket,
+                        .buffer_pool = buffer_pool,
                     },
                 },
                 .userdata = userdata,
                 .callback = struct {
                     fn wrap(loop: *Self, c: *Completion) void {
                         const cqe = c.cqe.?;
-                        const res = cqe.res;
                         const op = c.operation.recv;
 
-                        // error or success
-                        const result: RecvError!u31 = if (res <= 0)
-                            switch (@as(posix.E, @enumFromInt(-res))) {
-                                .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
-                                .INTR => return loop.enqueue(c), // we're interrupted, try again
-                                .AGAIN => error.WouldBlock,
-                                .BADF => error.Unexpected,
-                                .CONNREFUSED => error.ConnectionRefused,
-                                .FAULT => unreachable,
-                                .INVAL => unreachable,
-                                .NOBUFS => if (comptime options.io_uring.buffer_pool_mode) error.OutOfBuffers else error.SystemResources,
-                                .NOMEM => error.SystemResources,
-                                .NOTCONN => error.SocketNotConnected,
-                                .NOTSOCK => error.Unexpected,
-                                .CONNRESET => error.ConnectionResetByPeer,
-                                .TIMEDOUT => error.ConnectionTimedOut,
-                                .OPNOTSUPP => error.OperationNotSupported,
-                                .CANCELED => error.Cancelled,
-                                else => error.Unexpected,
-                            }
-                        else
-                            @intCast(res); // valid length
+                        // which buffer did the worker pick from the pool?
+                        const buffer_id: u16 = @intCast(cqe.flags >> linux.IORING_CQE_BUFFER_SHIFT);
 
-                        // what mode we're on
-                        if (comptime options.io_uring.buffer_pool_mode) {
-                            // which buffer did the worker pick from the pool?
-                            const buffer_id: u16 = @intCast(cqe.flags >> linux.IORING_CQE_BUFFER_SHIFT);
-
-                            // The application should check the flags of each CQE,
-                            // regardless of its result. If a posted CQE does not have the
-                            // IORING_CQE_F_MORE flag set then the multishot receive will be
-                            // done and the application should issue a new request.
-                            // https://man7.org/linux/man-pages/man3/io_uring_prep_recv_multishot.3.html
-                            if (cqe.flags & linux.IORING_CQE_F_MORE != 0) {
-                                loop.io_pending += 1;
-                            }
-
-                            // NOTE: Currently its up to caller to give back the buffer to kernel.
-                            // This behaviour might change in the future though.
-                            @call(
-                                .always_inline,
-                                callback,
-                                .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buf_pool, buffer_id, result },
-                            );
-                        } else {
-                            // regular buffer version
-                            @call(
-                                .always_inline,
-                                callback,
-                                .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer, result },
-                            );
+                        // The application should check the flags of each CQE,
+                        // regardless of its result. If a posted CQE does not have the
+                        // IORING_CQE_F_MORE flag set then the multishot receive will be
+                        // done and the application should issue a new request.
+                        // https://man7.org/linux/man-pages/man3/io_uring_prep_recv_multishot.3.html
+                        if (cqe.flags & linux.IORING_CQE_F_MORE != 0) {
+                            loop.io_pending += 1;
                         }
+
+                        // NOTE: Currently its up to caller to give the buffer back to kernel.
+                        // This behaviour might change in the future though.
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buf_pool, buffer_id });
 
                         // FIXME: IDK if we can benefit from this
                         // if (cqe.flags & linux.IORING_CQE_F_SOCK_NONEMPTY != 0) {
@@ -973,6 +958,7 @@ pub fn Loop(comptime options: Options) type {
                 connect,
                 accept,
                 recv,
+                recv_bp,
                 send,
                 timeout,
                 cancel,
@@ -995,20 +981,6 @@ pub fn Loop(comptime options: Options) type {
             // values needed by operations
             // TODO: hide the io_uring specific operation kinds behind a comptime switch, like `fds_update`.
             pub const Operation = union(OperationType) {
-                // recv comptime magic
-                pub const Recv = switch (options.io_uring.buffer_pool_mode) {
-                    // when provided buffers are enabled, we only take `group_id` from caller
-                    true => struct {
-                        socket: Socket,
-                        buf_pool: *BufferPool,
-                    },
-                    // regular recv operation, similar to read but no offset
-                    false => struct {
-                        socket: Socket,
-                        buffer: []u8,
-                    },
-                };
-
                 // fds_update comptime magic
                 pub const FdsUpdate = switch (options.io_uring.direct_descriptors_mode) {
                     true => struct {
@@ -1049,7 +1021,15 @@ pub fn Loop(comptime options: Options) type {
                     addr: posix.sockaddr = undefined,
                     addr_size: posix.socklen_t = @sizeOf(posix.sockaddr),
                 },
-                recv: Recv,
+                recv: struct {
+                    socket: Socket,
+                    buffer: []u8,
+                    //flags: u8,
+                },
+                recv_bp: struct {
+                    socket: Socket,
+                    buf_pool: *BufferPool,
+                },
                 send: struct {
                     socket: linux.fd_t,
                     buffer: []const u8,
@@ -1108,7 +1088,7 @@ pub fn Loop(comptime options: Options) type {
                                 .CONNREFUSED => error.ConnectionRefused,
                                 .FAULT => unreachable,
                                 .INVAL => unreachable,
-                                .NOBUFS => if (options.io_uring.buffer_pool_mode) error.OutOfBuffers else error.SystemResources,
+                                .NOBUFS => error.SystemResources,
                                 .NOMEM => error.SystemResources,
                                 .NOTCONN => error.SocketNotConnected,
                                 .NOTSOCK => error.Unexpected,
