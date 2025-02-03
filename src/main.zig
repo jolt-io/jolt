@@ -9,68 +9,45 @@ const BufferPool = @import("buffer_pool.zig").BufferPool(.io_uring);
 
 const allocator = std.heap.page_allocator;
 
-const DefaultLoop = Loop(.{});
+const DefaultLoop = Loop(.{
+    .io_uring = .{
+        .direct_descriptors_mode = true,
+    },
+});
 const Completion = DefaultLoop.Completion;
-
-pub fn SendQueue(comptime on_error: *const fn () void) type {
-    return struct {
-        completion: Completion = .{},
-
-        const Self = @This();
-
-        /// Initializes a send queue.
-        pub fn init() Self {
-            return .{};
-        }
-
-        fn onWrite(
-            userdata: *Self,
-            loop: *DefaultLoop,
-            completion: *Completion,
-            buffer: []const u8,
-            /// u31 is preferred for coercion
-            result: DefaultLoop.SendError!u31,
-        ) void {
-            _ = userdata;
-            _ = loop;
-            _ = completion;
-            _ = buffer;
-
-            _ = result catch |err| {
-                on_error();
-                @panic(@errorName(err));
-            };
-        }
-
-        /// Queues a send operation.
-        pub fn write(self: *Self, loop: *DefaultLoop, socket: linux.fd_t, buffer: []const u8, comptime link: DefaultLoop.Link) void {
-            loop.send(link, &self.completion, Self, self, socket, buffer, posix.MSG.WAITALL, onWrite);
-        }
-    };
-}
-
-fn onError() void {
-    std.debug.print("got error!\n", .{});
-}
 
 pub fn main() !void {
     var loop = try DefaultLoop.init();
     defer loop.deinit();
 
-    const stream = try std.net.tcpConnectToHost(allocator, "www.google.com", 80);
-    defer stream.close();
+    // create direct descriptors table
+    try loop.directDescriptors(.sparse, 2);
 
-    // queues write operations by their calling order
-    // this can be implemented via MSG_WAITALL and IOSQE_IO_LINK flags on io_uring
-    var sq = SendQueue(onError){};
-    sq.write(&loop, stream.handle, "GET / ", .linked);
-    sq.write(&loop, stream.handle, "HTTP/1.1", .linked);
-    sq.write(&loop, stream.handle, "\r\n\r\n", .unlinked);
+    const server = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
+
+    try posix.bind(server, &addr.any, addr.getOsSockLen());
+    try posix.listen(server, 128);
+
+    try loop.updateDescriptorsSync(0, &[_]linux.fd_t{server});
+    // we don't need the user-space fd anymore
+    posix.close(server);
+
+    const server_in_kernel: linux.fd_t = 0;
+
+    var accept_c = Completion{};
+    loop.accept(&accept_c, Completion, &accept_c, server_in_kernel, onAccept);
 
     try loop.run();
+}
 
-    var buffer: [8192]u8 = undefined;
-    const len = try stream.readAll(&buffer);
+fn onAccept(
+    _: *Completion,
+    _: *DefaultLoop,
+    _: *Completion,
+    result: Completion.OperationType.returnType(.accept),
+) void {
+    const client = result catch |err| @panic(@errorName(err));
 
-    std.debug.print("{s}\n", .{buffer[0..len]});
+    std.debug.print("{}\n", .{client});
 }
