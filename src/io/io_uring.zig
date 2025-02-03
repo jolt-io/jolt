@@ -32,11 +32,6 @@ pub fn Loop(comptime options: Options) type {
         pub fn init() !Self {
             var flags: u32 = 0;
 
-            // SQPOLL is disabled for now, I'm looking for ways to better utilize it.
-            //if (comptime options.io_uring.sqe_polling) {
-            //    flags |= linux.IORING_SETUP_SQPOLL;
-            //}
-
             if (comptime options.io_uring.single_issuer) {
                 flags |= linux.IORING_SETUP_SINGLE_ISSUER;
                 flags |= linux.IORING_SETUP_DEFER_TASKRUN;
