@@ -187,8 +187,8 @@ pub fn Loop(comptime options: Options) type {
                 },
                 .send => |op| {
                     sqe.prep_rw(.SEND, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
+                    // send flags
                     sqe.rw_flags = op.flags;
-
                     // FIXME: experimental SQE flags
                     sqe.flags |= @intCast(c.flags & 0xFF);
 
@@ -806,7 +806,9 @@ pub fn Loop(comptime options: Options) type {
         /// io_uring only.
         ///
         /// Updates file descriptors. Starting from the `offset`.
-        pub fn updateDescriptors(self: *Self, offset: u32, fds: []const linux.fd_t) !void {
+        /// This function works synchronously, which might suit better for some situations.
+        /// Check `updateDescriptorsAsync` function if you need asynchronous update.
+        pub fn updateDescriptorsSync(self: *Self, offset: u32, fds: []const linux.fd_t) !void {
             if (comptime !options.io_uring.direct_descriptors_mode) {
                 @compileError("direct descriptors are not enabled");
             }
@@ -844,7 +846,7 @@ pub fn Loop(comptime options: Options) type {
         /// io_uring only.
         ///
         /// Queues an `io_uring_prep_files_update` operation, similar to `updateDescriptors` but happens in async manner.
-        pub fn updateFds(
+        pub fn updateDescriptorsAsync(
             self: *Self,
             completion: *Completion,
             comptime T: type,
@@ -891,9 +893,9 @@ pub fn Loop(comptime options: Options) type {
 
         /// io_uring only.
         ///
-        /// Same as `updateFds` but this variant doesn't take `offset` argument. Instead, it allocates fds
-        /// to empty spots and fills the given `fds` slice with direct descriptors.
-        pub fn updateFdsAlloc(
+        /// Same as `updateDescriptorsAsync` but this variant doesn't take `offset` argument. Instead, it allocates fds
+        /// to empty spots and fills the given `fds` slice with direct descriptors. Order is preserved.
+        pub fn updateDescriptorsAsyncAlloc(
             self: *Self,
             completion: *Completion,
             comptime T: type,
