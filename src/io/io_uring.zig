@@ -574,11 +574,6 @@ pub fn Loop(comptime options: Options) type {
                         // NOTE: Currently its up to caller to give the buffer back to kernel.
                         // This behaviour might change in the future though.
                         @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buf_pool, buffer_id });
-
-                        // FIXME: IDK if we can benefit from this
-                        // if (cqe.flags & linux.IORING_CQE_F_SOCK_NONEMPTY != 0) {
-                        //     still has data...
-                        // }
                     }
                 }.wrap,
             };
