@@ -971,12 +971,19 @@ pub fn Loop(comptime options: Options) type {
 
                 /// Returns the return type for the given operation type.
                 /// Can be run on comptime, but not necessarily.
-                pub fn returns(op: OperationType) type {
+                pub fn returnType(op: OperationType) type {
                     return switch (op) {
-                        .connect => anyerror!void,
-                        .read => ReadError!u31,
+                        .none => unreachable,
+                        .read => ReadError!usize, // TODO: implement ReadError
+                        .write => anyerror!usize, // TODO: implement WriteError
+                        .connect => anyerror!void, // TODO: implement ConnectError
+                        .accept => AcceptError!Socket,
                         .recv => RecvError!usize,
+                        .recv_bp => RecvBufferPoolError!usize,
                         .send => SendError!usize,
+                        .timeout => TimeoutError!void,
+                        .fds_update => UpdateFdsError!i32,
+                        .close => void,
                         inline else => unreachable,
                     };
                 }
@@ -1046,11 +1053,16 @@ pub fn Loop(comptime options: Options) type {
             };
 
             // Returns the result of this completion.
-            pub fn getResult(completion: *Completion, comptime op_type: OperationType) op_type.returns() {
+            pub fn getResult(completion: *Completion, comptime op_type: OperationType) op_type.returnType() {
                 const cqe = completion.cqe.?;
                 const res = cqe.res;
 
                 switch (comptime op_type) {
+                    .none => unreachable,
+                    .read => unreachable,
+                    .write => unreachable,
+                    .connect => unreachable,
+                    .accept => {},
                     .send => {
                         if (res < 0) {
                             return switch (@as(posix.E, @enumFromInt(-res))) {
