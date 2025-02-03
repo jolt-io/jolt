@@ -614,8 +614,6 @@ pub fn Loop(comptime options: Options) type {
             userdata: *T,
             socket: Socket,
             buffer: []const u8,
-            // TODO: experimental send flags
-            flags: u32,
             comptime callback: *const fn (
                 userdata: *T,
                 loop: *Self,
@@ -628,12 +626,12 @@ pub fn Loop(comptime options: Options) type {
             completion.* = .{
                 .next = null,
                 // TODO: experimental linking
-                .flags = if (link == .linked) linux.IOSQE_IO_LINK else 0,
+                .flags = if (comptime link == .linked) linux.IOSQE_IO_LINK else 0,
                 .operation = .{
                     .send = .{
                         .socket = socket,
                         .buffer = buffer,
-                        .flags = flags,
+                        .flags = if (comptime link == .linked) linux.MSG.WAITALL else 0,
                     },
                 },
                 .userdata = userdata,
