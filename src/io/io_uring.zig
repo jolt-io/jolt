@@ -406,15 +406,15 @@ pub fn Loop(comptime options: Options) type {
         /// Completions given to multishot operations MUST NOT be reused until the multishot operation is either cancelled or encountered with an error.
         pub fn accept(
             self: *Self,
+            completion: *Completion,
             comptime T: type,
             userdata: *T,
-            completion: *Completion,
             socket: Socket,
             comptime callback: *const fn (
                 userdata: *T,
                 loop: *Self,
                 completion: *Completion,
-                result: AcceptError!Socket,
+                result: Completion.OperationType.returnType(.accept),
             ) void,
         ) void {
             completion.* = .{
@@ -432,7 +432,7 @@ pub fn Loop(comptime options: Options) type {
                         const cqe = c.cqe.?;
                         const res = cqe.res;
 
-                        const result: AcceptError!Socket = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                        const result: Completion.OperationType.returnType(.accept) = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
                             .INTR => return loop.enqueue(c), // we're interrupted, try again
                             .AGAIN => error.WouldBlock,
                             .BADF => error.Unexpected,
