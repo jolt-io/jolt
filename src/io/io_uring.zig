@@ -22,10 +22,10 @@ pub fn Loop(comptime options: Options) type {
         const Self = @This();
         /// io_uring instance
         ring: IO_Uring,
+        /// count of I/O operations that we're waiting to be done this does not include unqueued operations
+        io_pending: u64 = 0,
         /// I/O operations that're not queued yet
         unqueued: Intrusive(Completion) = .{},
-        /// count of I/O operations that we're waiting to be done
-        io_pending: u64 = 0,
 
         /// TODO: Check io_uring capabilities of kernel.
         /// Initializes a new event loop backed by io_uring.
@@ -192,7 +192,10 @@ pub fn Loop(comptime options: Options) type {
                 },
                 .send => |op| {
                     sqe.prep_rw(.SEND, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
-                    sqe.rw_flags = 0;
+                    sqe.rw_flags = op.flags;
+
+                    // FIXME: experimental SQE flags
+                    sqe.flags |= @intCast(c.flags & 0xFF);
 
                     // we want to use direct descriptors
                     if (comptime options.io_uring.direct_descriptors_mode) {
@@ -604,14 +607,20 @@ pub fn Loop(comptime options: Options) type {
             ConnectionTimedOut,
         } || CancellationError || UnexpectedError;
 
+        pub const Link = enum(u1) { linked, unlinked };
+
         /// Queues a send operation.
         pub fn send(
             self: *Self,
+            // TODO: experimental linking
+            comptime link: Link,
             completion: *Completion,
             comptime T: type,
             userdata: *T,
             socket: Socket,
             buffer: []const u8,
+            // TODO: experimental send flags
+            flags: u32,
             comptime callback: *const fn (
                 userdata: *T,
                 loop: *Self,
@@ -623,10 +632,13 @@ pub fn Loop(comptime options: Options) type {
         ) void {
             completion.* = .{
                 .next = null,
+                // TODO: experimental linking
+                .flags = if (link == .linked) linux.IOSQE_IO_LINK else 0,
                 .operation = .{
                     .send = .{
                         .socket = socket,
                         .buffer = buffer,
+                        .flags = flags,
                     },
                 },
                 .userdata = userdata,
@@ -785,7 +797,7 @@ pub fn Loop(comptime options: Options) type {
                 .sparse => u32,
             },
         ) !void {
-            if (!options.io_uring.direct_descriptors_mode) {
+            if (comptime !options.io_uring.direct_descriptors_mode) {
                 @compileError("direct descriptors are not enabled");
             }
 
@@ -800,7 +812,7 @@ pub fn Loop(comptime options: Options) type {
         ///
         /// Updates file descriptors. Starting from the `offset`.
         pub fn updateDescriptors(self: *Self, offset: u32, fds: []const linux.fd_t) !void {
-            if (!options.io_uring.direct_descriptors_mode) {
+            if (comptime !options.io_uring.direct_descriptors_mode) {
                 @compileError("direct descriptors are not enabled");
             }
 
@@ -853,7 +865,7 @@ pub fn Loop(comptime options: Options) type {
                 result: UpdateFdsError!i32, // result can only be max. int32 either
             ) void,
         ) void {
-            if (!options.io_uring.direct_descriptors_mode) {
+            if (comptime !options.io_uring.direct_descriptors_mode) {
                 @compileError("direct descriptors are not enabled");
             }
 
@@ -900,7 +912,7 @@ pub fn Loop(comptime options: Options) type {
                 result: UpdateFdsError!i32, // result can only be max. int32 either
             ) void,
         ) void {
-            if (!options.io_uring.direct_descriptors_mode) {
+            if (comptime !options.io_uring.direct_descriptors_mode) {
                 @compileError("direct descriptors are not enabled");
             }
 
@@ -938,6 +950,8 @@ pub fn Loop(comptime options: Options) type {
         pub const Completion = struct {
             /// Pointer to CQE used for this completion, filled after a call to `copy_cqes`
             cqe: ?*io_uring_cqe = null,
+            /// NOTE: experimental SQE flags
+            flags: u32 = 0,
             /// Intrusively linked
             next: ?*Completion = null,
             /// Operation intended by this completion
@@ -1024,7 +1038,7 @@ pub fn Loop(comptime options: Options) type {
                 recv: struct {
                     socket: Socket,
                     buffer: []u8,
-                    //flags: u8,
+                    //flags: u32,
                 },
                 recv_bp: struct {
                     socket: Socket,
@@ -1033,6 +1047,7 @@ pub fn Loop(comptime options: Options) type {
                 send: struct {
                     socket: linux.fd_t,
                     buffer: []const u8,
+                    flags: u32,
                 },
                 timeout: linux.kernel_timespec,
                 cancel: Cancel,
