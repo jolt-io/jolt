@@ -22,7 +22,9 @@ pub fn Loop(comptime options: Options) type {
         const Self = @This();
         /// io_uring instance
         ring: IO_Uring,
-        /// count of I/O operations that we're waiting to be done this does not include unqueued operations
+        /// count of CQEs that we're waiting to receive, includes;
+        /// * I/O operations that're submitted successfully (not in unqueued),
+        /// * I/O operations that create multiple CQEs (multishot operations, zero-copy send etc.).
         io_pending: u64 = 0,
         /// I/O operations that're not queued yet
         unqueued: Intrusive(Completion) = .{},
