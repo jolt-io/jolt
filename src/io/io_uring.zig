@@ -66,7 +66,7 @@ pub fn Loop(comptime options: Options) type {
                     // interrupted, try again
                     error.SignalInterrupt => continue,
                     // we'll flush completions right after anyway
-                    error.CompletionQueueOvercommitted => {},
+                    error.CompletionQueueOvercommitted => 0,
                     else => return err,
                 };
 
