@@ -188,7 +188,16 @@ pub fn Loop(comptime options: Options) type {
                     }
                 },
                 .send => |op| {
-                    sqe.prep_rw(.SEND, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
+                    // check if we're doing zero-copy
+                    const op_kind: linux.IORING_OP = blk: {
+                        if (comptime options.io_uring.zero_copy_sends) {
+                            break :blk .SEND_ZC;
+                        } else {
+                            break :blk .SEND;
+                        }
+                    };
+
+                    sqe.prep_rw(op_kind, op.socket, @intFromPtr(op.buffer.ptr), op.buffer.len, 0);
                     // send flags
                     sqe.rw_flags = op.flags;
                     // FIXME: experimental SQE flags
@@ -615,9 +624,8 @@ pub fn Loop(comptime options: Options) type {
                 userdata: *T,
                 loop: *Self,
                 completion: *Completion,
+                socket: Socket,
                 buffer: []const u8,
-                /// u31 is preferred for coercion
-                result: SendError!u31,
             ) void,
         ) void {
             completion.* = .{
@@ -625,10 +633,18 @@ pub fn Loop(comptime options: Options) type {
                 // TODO: experimental linking
                 .flags = if (comptime link == .linked) linux.IOSQE_IO_LINK else 0,
                 .operation = .{
-                    .send = .{
-                        .socket = socket,
-                        .buffer = buffer,
-                        .flags = if (comptime link == .linked) linux.MSG.WAITALL else 0,
+                    .send = switch (comptime options.io_uring.zero_copy_sends) {
+                        true => .{
+                            .socket = socket,
+                            .buffer = buffer,
+                            .flags = if (comptime link == .linked) linux.MSG.WAITALL else 0,
+                            .result = 0,
+                        },
+                        false => .{
+                            .socket = socket,
+                            .buffer = buffer,
+                            .flags = if (comptime link == .linked) linux.MSG.WAITALL else 0,
+                        },
                     },
                 },
                 .userdata = userdata,
@@ -637,35 +653,41 @@ pub fn Loop(comptime options: Options) type {
                         const cqe = c.cqe.?;
                         const res = cqe.res;
 
-                        const result: SendError!u31 = if (res < 0)
-                            switch (@as(posix.E, @enumFromInt(-res))) {
-                                .INTR => return loop.enqueue(c),
-                                .ACCES => error.AccessDenied,
-                                .AGAIN => error.WouldBlock,
-                                .ALREADY => error.FastOpenAlreadyInProgress,
-                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
-                                .BADF => error.FileDescriptorInvalid,
-                                .CONNRESET => error.ConnectionResetByPeer,
-                                .DESTADDRREQ => unreachable,
-                                .FAULT => unreachable,
-                                .INVAL => unreachable,
-                                .ISCONN => unreachable,
-                                .MSGSIZE => error.MessageTooBig,
-                                .NOBUFS => error.SystemResources,
-                                .NOMEM => error.SystemResources,
-                                .NOTCONN => error.SocketNotConnected,
-                                .NOTSOCK => error.FileDescriptorNotASocket,
-                                .OPNOTSUPP => error.OperationNotSupported,
-                                .PIPE => error.BrokenPipe,
-                                .TIMEDOUT => error.ConnectionTimedOut,
-                                .CANCELED => error.Cancelled,
-                                else => |err| posix.unexpectedErrno(err),
-                            }
-                        else
-                            @intCast(res); // valid length
+                        // zero-copy sends are activated
+                        // We likely receive 2 CQEs for this completion
+                        if (comptime options.io_uring.zero_copy_sends) {
+                            // we got the notification CQE
+                            if (cqe.flags & linux.IORING_CQE_F_NOTIF != 0) {
+                                // The notification's res field has to be 0
+                                assert(res == 0);
 
-                        const buf = c.operation.send.buffer;
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, buf, result });
+                                // execute the user provided callback
+                                const op = c.operation.send;
+                                @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer });
+
+                                // operation done
+                                return;
+                            }
+
+                            // copy the send result, we won't get a chance to do it again
+                            c.operation.send.result = cqe.res;
+
+                            // There will be another CQE if this is true
+                            // To wait for it, we can increment the pending count by 1
+                            if (cqe.flags & linux.IORING_CQE_F_MORE != 0) {
+                                @branchHint(.likely);
+                                loop.io_pending += 1;
+                            } else {
+                                // interestingly, we won't get a notification CQE
+                                // execute the user provided callback
+                                const op = c.operation.send;
+                                @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer });
+                            }
+                        } else {
+                            // regular send operations
+                            const op = c.operation.send;
+                            @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer });
+                        }
                     }
                 }.wrap,
             };
@@ -994,6 +1016,21 @@ pub fn Loop(comptime options: Options) type {
             // values needed by operations
             // TODO: hide the io_uring specific operation kinds behind a comptime switch, like `fds_update`.
             pub const Operation = union(OperationType) {
+                // send comptime magic
+                pub const Send = switch (options.io_uring.zero_copy_sends) {
+                    true => struct {
+                        socket: linux.fd_t,
+                        buffer: []const u8,
+                        flags: u32,
+                        result: i32, // holds the result of the first received CQE
+                    },
+                    false => struct {
+                        socket: linux.fd_t,
+                        buffer: []const u8,
+                        flags: u32,
+                    },
+                };
+
                 // fds_update comptime magic
                 pub const FdsUpdate = switch (options.io_uring.direct_descriptors_mode) {
                     true => struct {
@@ -1037,17 +1074,13 @@ pub fn Loop(comptime options: Options) type {
                 recv: struct {
                     socket: Socket,
                     buffer: []u8,
-                    //flags: u32,
+                    //TODO: flags: u32,
                 },
                 recv_bp: struct {
                     socket: Socket,
                     buf_pool: *BufferPool,
                 },
-                send: struct {
-                    socket: linux.fd_t,
-                    buffer: []const u8,
-                    flags: u32,
-                },
+                send: Send,
                 timeout: linux.kernel_timespec,
                 cancel: Cancel,
                 fds_update: FdsUpdate,
@@ -1066,7 +1099,16 @@ pub fn Loop(comptime options: Options) type {
                     .connect => unreachable,
                     .accept => {},
                     .send => {
-                        if (res < 0) {
+                        // if zero-copy sends are activated, the result is held at `operation`
+                        const result = blk: {
+                            if (comptime options.io_uring.zero_copy_sends) {
+                                break :blk completion.operation.send.result;
+                            } else {
+                                break :blk res;
+                            }
+                        };
+
+                        if (result < 0) {
                             return switch (@as(posix.E, @enumFromInt(-res))) {
                                 .INTR => unreachable, // TODO: this used to enqueue the completion again
                                 .ACCES => error.AccessDenied,
@@ -1092,7 +1134,7 @@ pub fn Loop(comptime options: Options) type {
                             };
                         } else {
                             // valid length
-                            return @intCast(res);
+                            return @intCast(result);
                         }
                     },
                     .recv => {
