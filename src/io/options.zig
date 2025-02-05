@@ -13,7 +13,7 @@ pub const Options = struct {
     /// TODO: investigate `io_uring_prep_fixed_fd_install`.
     /// TODO: investigate `io_uring_register_ring_fd`.
     /// io_uring specific options.
-    io_uring: struct {
+    io_uring: packed struct {
         /// On by default.
         ///
         /// Indicates the ring that only a single thread will make submissions.
