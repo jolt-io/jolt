@@ -1128,10 +1128,10 @@ pub fn Loop(comptime options: Options) type {
                 unreachable;
             }
         };
+
+        // on unix, there's a unified fd type that's used for both sockets and file, pipe etc. handles.
+        // since this library is intended for cross platform usage and windows separates file descriptors by different kinds, I've decided to adapt the same mindset to here.
+        pub const Handle = linux.fd_t;
+        pub const Socket = linux.fd_t;
     };
 }
-
-// on unix, there's a unified fd type that's used for both sockets and file, pipe etc. handles.
-// since this library is intended for cross platform usage and windows separates file descriptors by different kinds, I've decided to adapt the same mindset to here.
-pub const Handle = linux.fd_t;
-pub const Socket = linux.fd_t;
