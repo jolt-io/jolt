@@ -43,6 +43,7 @@ pub const Options = struct {
         /// TODO: Support `io_uring_prep_socket`, `io_uring_prep_open` etc. functions for direct descriptors.
         direct_descriptors_mode: bool = false,
 
+        /// FIXME: Currently buggy, don't use it.
         /// Experimental.
         ///
         /// If this flag is activated, send operations will be done in zero-copy fashion.
