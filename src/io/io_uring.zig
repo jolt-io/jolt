@@ -25,9 +25,11 @@ pub fn Loop(comptime options: Options) type {
         /// count of CQEs that we're waiting to receive, includes;
         /// * I/O operations that're submitted successfully (not in unqueued),
         /// * I/O operations that create multiple CQEs (multishot operations, zero-copy send etc.).
-        io_pending: u64 = 0,
+        io_pending: u32 = 0,
         /// I/O operations that're not queued yet
         unqueued: Intrusive(Completion) = .{},
+        /// Completions that're ready for their callbacks to run
+        completed: Intrusive(Completion) = .{},
 
         /// TODO: Check io_uring capabilities of kernel.
         /// Initializes a new event loop backed by io_uring.
@@ -62,58 +64,67 @@ pub fn Loop(comptime options: Options) type {
             var cqes: [512]io_uring_cqe = undefined;
 
             while (self.hasIo()) {
-                _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
-                    // interrupted, try again
-                    error.SignalInterrupt => continue,
-                    // we'll flush completions right after anyway
-                    error.CompletionQueueOvercommitted => 0,
-                    else => return err,
-                };
+                // Flush any queued SQEs and reuse the same syscall to wait for completions if required:
+                try self.flushSubmissions(&cqes);
+                // We can now just peek for any CQEs without waiting and without another syscall:
+                try self.flushCompletions(&cqes, self.io_pending);
 
-                try self.flush(&cqes);
+                // Retry queueing completions that were unable to be queued before
+                {
+                    var copy = self.unqueued;
+                    self.unqueued = .{};
+                    while (copy.pop()) |c| self.enqueue(c);
+                }
+
+                // Run completions
+                while (self.completed.pop()) |c| {
+                    c.callback(self, c);
+                }
             }
         }
 
-        /// This function does 3 things in a single call;
-        /// * Flushes completions,
-        /// * Retries submitting unqueued completions,
-        /// * Runs the callbacks of completed completions.
-        fn flush(self: *Self, slice: []io_uring_cqe) !void {
-            // start by flushing completions that're queued
-            const completed = try self.flushCompletions(slice);
+        fn flushCompletions(self: *Self, slice: []io_uring_cqe, wait_nr: u32) !void {
+            var remaining = wait_nr;
 
-            // Retry queueing completions that're unable to be queued before
-            {
-                var copy = self.unqueued;
-                self.unqueued = .{};
-                while (copy.pop()) |c| self.enqueue(c);
-            }
-
-            // run completions
-            for (slice[0..completed]) |*cqe| {
-                const c: *Completion = @ptrFromInt(cqe.user_data);
-                // FIXME: I'm not sure passing a pointer here is okay
-                c.cqe = cqe;
-                // Execute the completion
-                c.callback(self, c);
-            }
-        }
-
-        fn flushCompletions(self: *Self, slice: []io_uring_cqe) !u32 {
             while (true) {
-                const completed = self.ring.copy_cqes(slice, 1) catch |err| switch (err) {
+                const completed = self.ring.copy_cqes(slice, remaining) catch |err| switch (err) {
                     error.SignalInterrupt => continue,
                     else => return err,
                 };
+
+                if (completed > remaining) remaining = 0 else remaining -= completed;
 
                 // Decrement as much as completed events.
                 // Currently, `io_pending` is only decremented here.
                 self.io_pending -= completed;
 
-                return completed;
-            }
+                for (slice[0..completed]) |*cqe| {
+                    const c: *Completion = @ptrFromInt(cqe.user_data);
+                    c.cqe = cqe;
+                    // We do not run the completion here (instead appending to a linked list) to avoid:
+                    // * recursion through `flush_submissions()` and `flush_completions()`,
+                    // * unbounded stack usage, and
+                    // * confusing stack traces.
+                    self.completed.push(c);
+                }
 
-            unreachable;
+                if (completed < slice.len) break;
+            }
+        }
+
+        fn flushSubmissions(self: *Self, slice: []io_uring_cqe) !void {
+            while (true) {
+                _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                    error.SignalInterrupt => continue,
+                    error.CompletionQueueOvercommitted, error.SystemResources => {
+                        try self.flushCompletions(slice, 1);
+                        continue;
+                    },
+                    else => return err,
+                };
+
+                break;
+            }
         }
 
         /// Registers a completion to the loop.
