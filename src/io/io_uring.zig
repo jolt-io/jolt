@@ -262,7 +262,17 @@ pub fn Loop(comptime options: Options) type {
             self.io_pending += 1;
         }
 
-        pub const ReadError = anyerror;
+        pub const ReadError = error{
+            EndOfStream,
+            NotOpenForReading,
+            ConnectionResetByPeer,
+            Alignment,
+            InputOutput,
+            IsDir,
+            SystemResources,
+            Unseekable,
+            ConnectionTimedOut,
+        } || CancellationError || UnexpectedError;
 
         /// Queues a read operation.
         pub fn read(
@@ -277,7 +287,7 @@ pub fn Loop(comptime options: Options) type {
                 loop: *Self,
                 completion: *Completion,
                 buffer: []u8,
-                result: ReadError!u31,
+                result: ReadError!usize,
             ) void,
         ) void {
             completion.* = .{
@@ -297,7 +307,7 @@ pub fn Loop(comptime options: Options) type {
                         const cqe = c.cqe.?;
                         const res = cqe.res;
 
-                        const result: ReadError!u31 = if (res <= 0)
+                        const result: ReadError!usize = if (res <= 0)
                             switch (@as(posix.E, @enumFromInt(-res))) {
                                 .SUCCESS => error.EndOfStream,
                                 .INTR, .AGAIN => {
@@ -311,6 +321,7 @@ pub fn Loop(comptime options: Options) type {
                                 .INVAL => error.Alignment,
                                 .IO => error.InputOutput,
                                 .ISDIR => error.IsDir,
+                                .CANCELED => error.Cancelled,
                                 .NOBUFS => error.SystemResources,
                                 .NOMEM => error.SystemResources,
                                 .NXIO => error.Unseekable,
