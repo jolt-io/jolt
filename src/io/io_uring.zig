@@ -307,31 +307,28 @@ pub fn Loop(comptime options: Options) type {
                         const cqe = c.cqe.?;
                         const res = cqe.res;
 
-                        const result: ReadError!usize = if (res <= 0)
-                            switch (@as(posix.E, @enumFromInt(-res))) {
-                                .SUCCESS => error.EndOfStream,
-                                .INTR, .AGAIN => {
-                                    // Some file systems, like XFS, can return EAGAIN even when
-                                    // reading from a blocking file without flags like RWF_NOWAIT.
-                                    return loop.enqueue(c);
-                                },
-                                .BADF => error.NotOpenForReading,
-                                .CONNRESET => error.ConnectionResetByPeer,
-                                .FAULT => unreachable,
-                                .INVAL => error.Alignment,
-                                .IO => error.InputOutput,
-                                .ISDIR => error.IsDir,
-                                .CANCELED => error.Cancelled,
-                                .NOBUFS => error.SystemResources,
-                                .NOMEM => error.SystemResources,
-                                .NXIO => error.Unseekable,
-                                .OVERFLOW => error.Unseekable,
-                                .SPIPE => error.Unseekable,
-                                .TIMEDOUT => error.ConnectionTimedOut,
-                                else => |err| posix.unexpectedErrno(err),
-                            }
-                        else
-                            @intCast(res);
+                        const result: ReadError!usize = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                            .SUCCESS => error.EndOfStream,
+                            .INTR, .AGAIN => {
+                                // Some file systems, like XFS, can return EAGAIN even when
+                                // reading from a blocking file without flags like RWF_NOWAIT.
+                                return loop.enqueue(c);
+                            },
+                            .BADF => error.NotOpenForReading,
+                            .CONNRESET => error.ConnectionResetByPeer,
+                            .FAULT => unreachable,
+                            .INVAL => error.Alignment,
+                            .IO => error.InputOutput,
+                            .ISDIR => error.IsDir,
+                            .CANCELED => error.Cancelled,
+                            .NOBUFS => error.SystemResources,
+                            .NOMEM => error.SystemResources,
+                            .NXIO => error.Unseekable,
+                            .OVERFLOW => error.Unseekable,
+                            .SPIPE => error.Unseekable,
+                            .TIMEDOUT => error.ConnectionTimedOut,
+                            else => |err| posix.unexpectedErrno(err),
+                        } else @intCast(res);
 
                         const buf = c.operation.read.buffer;
                         // invoke the user provided callback
@@ -343,21 +340,35 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
+        pub const WriteError = error{
+            WouldBlock,
+            NotOpenForWriting,
+            NotConnected,
+            DiskQuota,
+            FileTooBig,
+            Alignment,
+            InputOutput,
+            NoSpaceLeft,
+            Unseekable,
+            AccessDenied,
+            BrokenPipe,
+        } || CancellationError || UnexpectedError;
+
         /// Queues a write operation.
         pub fn write(
             self: *Self,
+            completion: *Completion,
             comptime T: type,
             userdata: *T,
-            completion: *Completion,
             handle: Handle,
             buffer: []const u8,
-            offset: u64,
             comptime callback: *const fn (
                 userdata: *T,
                 loop: *Self,
                 completion: *Completion,
-                // FIXME: use a well defined error union type instead of anyerror
-                //result: anyerror!usize,
+                handle: Handle,
+                buffer: []const u8,
+                result: WriteError!usize,
             ) void,
         ) void {
             completion.* = .{
@@ -366,15 +377,41 @@ pub fn Loop(comptime options: Options) type {
                     .write = .{
                         .handle = handle,
                         .buffer = buffer,
-                        .offset = offset,
+                        // offset is a u64 but if the value is -1 then it uses the offset in the fd.
+                        .offset = comptime @bitCast(@as(i64, -1)),
                     },
                 },
                 .userdata = userdata,
                 // following is what happens when we receive a sqe for this completion.
                 .callback = comptime struct {
                     fn wrap(loop: *Self, c: *Completion) void {
+                        const cqe = c.cqe.?;
+                        const res = cqe.res;
+
+                        const result: Completion.OperationType.returnType(.write) = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                            .SUCCESS => error.EndOfStream, // 0 read
+                            .INTR => return loop.enqueue(completion),
+                            .AGAIN => error.WouldBlock,
+                            .BADF => error.NotOpenForWriting,
+                            .CANCELED => error.Cancelled,
+                            .DESTADDRREQ => error.NotConnected,
+                            .DQUOT => error.DiskQuota,
+                            .FAULT => unreachable,
+                            .FBIG => error.FileTooBig,
+                            .INVAL => error.Alignment,
+                            .IO => error.InputOutput,
+                            .NOSPC => error.NoSpaceLeft,
+                            .NXIO => error.Unseekable,
+                            .OVERFLOW => error.Unseekable,
+                            .PERM => error.AccessDenied,
+                            .PIPE => error.BrokenPipe,
+                            .SPIPE => error.Unseekable,
+                            else => error.Unexpected,
+                        } else @intCast(res);
+
+                        const op = c.operation.write;
                         // invoke the user provided callback
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c });
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.handle, op.buffer, result });
                     }
                 }.wrap,
             };
@@ -1134,7 +1171,7 @@ pub fn Loop(comptime options: Options) type {
                     return switch (op) {
                         .none => unreachable,
                         .read => ReadError!usize, // TODO: implement ReadError
-                        .write => anyerror!usize, // TODO: implement WriteError
+                        .write => WriteError!usize,
                         .connect => ConnectError!void,
                         .accept => AcceptError!Socket,
                         .recv => RecvError!usize,
