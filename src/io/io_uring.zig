@@ -838,6 +838,42 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
+        /// Creates a new TCP stream socket.
+        pub fn tcpStream(_: Self) !Socket {
+            return posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+        }
+
+        /// Creates a new TCP listener socket, binds it to an address and starts listening.
+        pub fn tcpListener(self: Self, addr: std.net.Address, backlog: u31) !Socket {
+            const socket = try self.tcpStream();
+            try posix.bind(socket, &addr.any, addr.getOsSockLen());
+            try posix.listen(socket, backlog);
+
+            return socket;
+        }
+
+        /// Sets REUSEADDR flag on a given socket.
+        pub fn setReuseAddr(_: Self, socket: Socket) posix.SetSockOptError!void {
+            return posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        }
+
+        /// Sets REUSEPORT flag on a given socket if possible.
+        pub fn setReusePort(_: Self, socket: Socket) posix.SetSockOptError!void {
+            if (@hasDecl(std.posix.SO, "REUSEPORT")) {
+                return posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
+            }
+        }
+
+        /// Enables/disables TCP_NODELAY setting on a given socket.
+        pub fn setTcpNoDelay(_: Self, socket: Socket, on: bool) posix.SetSockOptError!void {
+            return posix.setsockopt(socket, posix.IPPROTO.TCP, posix.TCP.NODELAY, &std.mem.toBytes(@as(c_int, @intFromBool(on))));
+        }
+
+        /// Enables/disables SO_KEEPALIVE setting on a given socket.
+        pub fn setTcpKeepAlive(_: Self, socket: Socket, on: bool) posix.SetSockOptError!void {
+            return posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.KEEPALIVE, &std.mem.toBytes(@as(c_int, @intFromBool(on))));
+        }
+
         pub const Registration = enum(u1) { regular, sparse };
 
         /// TODO: We might want to support resource tagging too, needs further investigations.
