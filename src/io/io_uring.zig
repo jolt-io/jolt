@@ -576,6 +576,7 @@ pub fn Loop(comptime options: Options) type {
                 socket: Socket,
                 buffer_pool: *BufferPool,
                 buffer_id: u16,
+                result: RecvBufferPoolError!usize,
             ) void,
         ) void {
             completion.* = .{
@@ -583,14 +584,37 @@ pub fn Loop(comptime options: Options) type {
                 .operation = .{
                     .recv_bp = .{
                         .socket = socket,
-                        .buffer_pool = buffer_pool,
+                        .buf_pool = buffer_pool,
                     },
                 },
                 .userdata = userdata,
                 .callback = struct {
                     fn wrap(loop: *Self, c: *Completion) void {
                         const cqe = c.cqe.?;
-                        const op = c.operation.recv;
+                        const res = cqe.res;
+                        const op = c.operation.recv_bp;
+
+                        const result: Completion.OperationType.returnType(.recv_bp) = if (res <= 0)
+                            switch (@as(posix.E, @enumFromInt(-res))) {
+                                .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
+                                .INTR => return loop.enqueue(c), // we're interrupted, try again
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.Unexpected,
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .NOBUFS => error.OutOfBuffers,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.Unexpected,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .CANCELED => error.Cancelled,
+                                else => error.Unexpected,
+                            }
+                        else
+                            @intCast(res);
 
                         // which buffer did the worker pick from the pool?
                         const buffer_id: u16 = @intCast(cqe.flags >> linux.IORING_CQE_BUFFER_SHIFT);
@@ -606,7 +630,7 @@ pub fn Loop(comptime options: Options) type {
 
                         // NOTE: Currently its up to caller to give the buffer back to kernel.
                         // This behaviour might change in the future though.
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buf_pool, buffer_id });
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buf_pool, buffer_id, result });
                     }
                 }.wrap,
             };
