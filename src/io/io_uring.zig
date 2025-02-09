@@ -185,7 +185,7 @@ pub fn Loop(comptime options: Options) type {
                 .recv_bp => |op| {
                     // recv multishot requires everything to be zero since the buffer will be selected automatically
                     sqe.prep_rw(.RECV, op.socket, 0, 0, 0);
-                    // which buffer group to use, in liburing, field set is `buf_group` but it's actually defined as a union
+                    // which buffer group to use, in liburing, the actual field set is `buf_group` but it's defined as a union so
                     sqe.buf_index = op.buf_pool.group_id;
                     // indicate that we've selected a buffer group
                     sqe.flags |= linux.IOSQE_BUFFER_SELECT;
