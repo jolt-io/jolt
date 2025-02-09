@@ -383,6 +383,27 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
+        pub const ConnectError = error{
+            AccessDenied,
+            AddressInUse,
+            AddressNotAvailable,
+            AddressFamilyNotSupported,
+            WouldBlock,
+            OpenAlreadyInProgress,
+            FileDescriptorInvalid,
+            ConnectionRefused,
+            ConnectionResetByPeer,
+            AlreadyConnected,
+            NetworkUnreachable,
+            HostUnreachable,
+            FileNotFound,
+            FileDescriptorNotASocket,
+            PermissionDenied,
+            ProtocolNotSupported,
+            ConnectionTimedOut,
+            SystemResources,
+        } || CancellationError || UnexpectedError;
+
         /// Queues a connect operation.
         pub fn connect(
             self: *Self,
@@ -395,6 +416,9 @@ pub fn Loop(comptime options: Options) type {
                 userdata: *T,
                 loop: *Self,
                 completion: *Completion,
+                socket: Socket,
+                addr: std.net.Address,
+                result: ConnectError!void,
             ) void,
         ) void {
             completion.* = .{
@@ -408,7 +432,35 @@ pub fn Loop(comptime options: Options) type {
                 .userdata = userdata,
                 .callback = comptime struct {
                     fn wrap(loop: *Self, c: *Completion) void {
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c });
+                        const cqe = c.cqe.?;
+                        const res = cqe.res;
+
+                        const result: Completion.OperationType.returnType(.connect) = if (res < 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                            .INTR => return loop.enqueue(c),
+                            .ACCES => error.AccessDenied,
+                            .ADDRINUSE => error.AddressInUse,
+                            .ADDRNOTAVAIL => error.AddressNotAvailable,
+                            .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                            .AGAIN, .INPROGRESS => error.WouldBlock,
+                            .ALREADY => error.OpenAlreadyInProgress,
+                            .BADF => error.FileDescriptorInvalid,
+                            .CANCELED => error.Cancelled,
+                            .CONNREFUSED => error.ConnectionRefused,
+                            .CONNRESET => error.ConnectionResetByPeer,
+                            .FAULT => unreachable,
+                            .ISCONN => error.AlreadyConnected,
+                            .NETUNREACH => error.NetworkUnreachable,
+                            .HOSTUNREACH => error.HostUnreachable,
+                            .NOENT => error.FileNotFound,
+                            .NOTSOCK => error.FileDescriptorNotASocket,
+                            .PERM => error.PermissionDenied,
+                            .PROTOTYPE => error.ProtocolNotSupported,
+                            .TIMEDOUT => error.ConnectionTimedOut,
+                            else => error.Unexpected,
+                        };
+
+                        const op = c.operation.connect;
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.addr, result });
                     }
                 }.wrap,
             };
@@ -1082,7 +1134,7 @@ pub fn Loop(comptime options: Options) type {
                         .none => unreachable,
                         .read => ReadError!usize, // TODO: implement ReadError
                         .write => anyerror!usize, // TODO: implement WriteError
-                        .connect => anyerror!void, // TODO: implement ConnectError
+                        .connect => ConnectError!void,
                         .accept => AcceptError!Socket,
                         .recv => RecvError!usize,
                         .recv_bp => RecvBufferPoolError!usize,
