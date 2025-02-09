@@ -1170,7 +1170,7 @@ pub fn Loop(comptime options: Options) type {
                 pub fn returnType(op: OperationType) type {
                     return switch (op) {
                         .none => unreachable,
-                        .read => ReadError!usize, // TODO: implement ReadError
+                        .read => ReadError!usize,
                         .write => WriteError!usize,
                         .connect => ConnectError!void,
                         .accept => AcceptError!Socket,
