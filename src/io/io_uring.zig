@@ -334,7 +334,6 @@ pub fn Loop(comptime options: Options) type {
                             @intCast(res);
 
                         const buf = c.operation.read.buffer;
-
                         // invoke the user provided callback
                         @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, buf, result });
                     }
@@ -499,7 +498,8 @@ pub fn Loop(comptime options: Options) type {
                 userdata: *T,
                 loop: *Self,
                 completion: *Completion,
-                result: Completion.OperationType.returnType(.accept),
+                socket: Socket,
+                result: AcceptError!Socket,
             ) void,
         ) void {
             completion.* = .{
@@ -543,8 +543,9 @@ pub fn Loop(comptime options: Options) type {
                             loop.io_pending += 1;
                         }
 
+                        const listener = c.operation.accept.socket;
                         // invoke the user provided callback
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, result });
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, listener, result });
                     }
                 }.wrap,
             };
