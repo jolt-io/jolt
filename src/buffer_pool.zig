@@ -90,7 +90,7 @@ pub fn BufferPool(comptime io_engine: IoEngine) type {
             /// Get a buffer by id.
             pub inline fn get(self: *Self, buffer_id: u16) []u8 {
                 const head = self.buffer_size * buffer_id;
-                return self.pool[head .. head + self.buffer_size];
+                return (self.pool + head)[0..self.buffer_size];
             }
 
             /// Release a buffer back to the kernel.
