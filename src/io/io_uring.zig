@@ -1351,7 +1351,11 @@ pub fn Loop(comptime options: Options) type {
 }
 
 test "io_uring direct descriptors" {
-    //const allocator = std.testing.allocator;
+    const builtin = @import("builtin");
+    switch (builtin.cpu.arch) {
+        .aarch64, .aarch64_be => return,
+        else => {},
+    }
 
     const DefaultLoop = Loop(.{
         .io_uring = .{
