@@ -1349,3 +1349,114 @@ pub fn Loop(comptime options: Options) type {
         pub const Socket = linux.fd_t;
     };
 }
+
+test "io_uring direct descriptors" {
+    //const allocator = std.testing.allocator;
+
+    const DefaultLoop = Loop(.{
+        .io_uring = .{
+            .direct_descriptors_mode = true,
+        },
+    });
+
+    const Completion = DefaultLoop.Completion;
+
+    // create a loop
+    var loop = try DefaultLoop.init();
+    defer loop.deinit();
+
+    // get file descriptor limits
+    const rlimit = try posix.getrlimit(.NOFILE);
+
+    // create direct descriptors table
+    try loop.directDescriptors(.sparse, @intCast(rlimit.max & std.math.maxInt(u32)));
+
+    const server = try loop.tcpListener(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080), 128);
+    try loop.setReuseAddr(server);
+    try loop.setTcpNoDelay(server, true);
+
+    var update_descriptors_c = Completion{};
+    var fds = [_]linux.fd_t{server};
+
+    loop.updateDescriptorsAsyncAlloc(&update_descriptors_c, Completion, &update_descriptors_c, &fds, struct {
+        fn onUpdate(
+            _: *Completion,
+            _: *DefaultLoop,
+            _: *Completion,
+            _fds: []linux.fd_t,
+            result: DefaultLoop.UpdateFdsError!i32,
+        ) void {
+            const res = result catch unreachable;
+            std.testing.expect(res == 1) catch unreachable;
+            std.testing.expect(_fds[@intCast(res & std.math.maxInt(u31) - 1)] == 0) catch unreachable;
+        }
+    }.onUpdate);
+
+    try loop.run();
+}
+
+test "io_uring accept/connect/cancel" {
+    const DefaultLoop = Loop(.{});
+    const Completion = DefaultLoop.Completion;
+    const Socket = DefaultLoop.Socket;
+
+    var loop = try DefaultLoop.init();
+    defer loop.deinit();
+
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8081);
+
+    // create a listener socket
+    const server = try loop.tcpListener(addr, 128);
+    try loop.setReuseAddr(server);
+    try loop.setTcpNoDelay(server, true);
+
+    // start accepting connections
+    var accept_c = Completion{};
+    var cancel_c = Completion{};
+
+    // queue accepting
+    loop.accept(&accept_c, Completion, &cancel_c, server, struct {
+        fn onAccept(
+            _cancel_c: *Completion,
+            _loop: *DefaultLoop,
+            _accept_c: *Completion,
+            _: Socket,
+            result: DefaultLoop.AcceptError!Socket,
+        ) void {
+            const client = result catch |err| switch (err) {
+                error.Cancelled => {
+                    // expected after first accept
+                    std.testing.expectError(error.Cancelled, result) catch unreachable;
+                    return;
+                },
+                else => unreachable,
+            };
+            defer posix.close(client);
+
+            // stop accepting
+            _loop.cancel(.completion, _accept_c, _cancel_c);
+        }
+    }.onAccept);
+
+    // create a stream socket
+    const stream = try loop.tcpStream();
+    try loop.setTcpNoDelay(stream, true);
+
+    var connect_c = Completion{};
+
+    // queue a connect
+    loop.connect(Completion, &connect_c, &connect_c, stream, addr, struct {
+        fn onConnect(
+            _: *Completion,
+            _: *DefaultLoop,
+            _: *Completion,
+            _: Socket,
+            _: std.net.Address,
+            result: DefaultLoop.ConnectError!void,
+        ) void {
+            result catch unreachable;
+        }
+    }.onConnect);
+
+    try loop.run();
+}
