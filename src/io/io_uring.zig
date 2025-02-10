@@ -1351,12 +1351,6 @@ pub fn Loop(comptime options: Options) type {
 }
 
 test "io_uring direct descriptors" {
-    const builtin = @import("builtin");
-    switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => return,
-        else => {},
-    }
-
     const DefaultLoop = Loop(.{
         .io_uring = .{
             .direct_descriptors_mode = true,
