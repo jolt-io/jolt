@@ -9,18 +9,15 @@ const IO_Uring = linux.IoUring;
 const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
 
-/// TODO: add support for this in zig std.
 pub inline fn io_uring_prep_cancel_fd(sqe: *io_uring_sqe, fd: linux.fd_t, flags: u32) void {
     sqe.prep_rw(.ASYNC_CANCEL, fd, 0, 0, 0);
     sqe.rw_flags = flags | linux.IORING_ASYNC_CANCEL_FD;
 }
 
-/// TODO: add support for this in zig std.
 pub inline fn io_uring_prep_files_update(sqe: *io_uring_sqe, fds: []const linux.fd_t, offset: u32) void {
     sqe.prep_rw(.FILES_UPDATE, -1, @intFromPtr(fds.ptr), fds.len, @intCast(offset));
 }
 
-/// TODO: add support for this in zig std.
 /// FIXME: implementation here doesn't match to liburing, might want to change that.
 /// https://github.com/axboe/liburing/blob/76bb80a36107e3808c4770c8112583813a4e511b/src/register.c#L139
 pub fn io_uring_register_files_sparse(ring: *IO_Uring, nr: u32) !void {
