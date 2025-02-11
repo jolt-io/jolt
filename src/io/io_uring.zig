@@ -221,17 +221,6 @@ pub fn Loop(comptime options: Options) type {
                 },
                 // FIXME: IORING_TIMEOUT_ETIME_SUCCESS seems to have no effect here
                 .timeout => |*ts| sqe.prep_timeout(ts, 0, linux.IORING_TIMEOUT_ETIME_SUCCESS),
-                .cancel => |op| switch (op) {
-                    .all_io => |fd| ex.io_uring_prep_cancel_fd(sqe, fd, linux.IORING_ASYNC_CANCEL_ALL),
-                    .completion => |comp| {
-                        if (comp.operation == .timeout) {
-                            // prepare a timeout removal instead
-                            sqe.prep_timeout_remove(@intCast(@intFromPtr(comp)), 0);
-                        } else {
-                            sqe.prep_cancel(@intCast(@intFromPtr(comp)), 0);
-                        }
-                    },
-                },
                 .fds_update => |op| switch (comptime options.io_uring.direct_descriptors_mode) {
                     true => ex.io_uring_prep_files_update(sqe, op.fds, op.offset),
                     false => unreachable,
@@ -876,31 +865,6 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
-        /// FIXME: refactor
-        /// Queues a cancel operation.
-        /// If a handle is given as target, all I/O operations of the handle are cancelled.
-        pub fn cancel(
-            self: *Self,
-            comptime cancel_type: Completion.Operation.CancelType,
-            target: @FieldType(Completion.Operation.Cancel, @tagName(cancel_type)),
-            completion: *Completion,
-        ) void {
-            completion.* = .{
-                .next = null,
-                .operation = .{
-                    .cancel = @unionInit(Completion.Operation.Cancel, @tagName(cancel_type), target),
-                },
-                .userdata = null,
-                .callback = comptime struct {
-                    fn wrap(_: *Self, _: *Completion) void {
-                        std.debug.print("cancellation run\n", .{});
-                    }
-                }.wrap,
-            };
-
-            self.enqueue(completion);
-        }
-
         /// Queues a close operation.
         /// Supports both file descriptors and direct descriptors.
         /// This operation doesn't invoke a callback, so the given descriptor must be considered invalid after this call.
@@ -1161,7 +1125,7 @@ pub fn Loop(comptime options: Options) type {
                 recv_bp,
                 send,
                 timeout,
-                cancel,
+                //cancel,
                 fds_update,
                 close,
 
@@ -1214,12 +1178,12 @@ pub fn Loop(comptime options: Options) type {
 
                 // various kinds of cancel operations are supported
                 // https://man7.org/linux/man-pages/man3/io_uring_prep_cancel.3.html
-                pub const CancelType = enum(u1) { all_io, completion };
+                //pub const CancelType = enum(u1) { all_io, completion };
 
-                pub const Cancel = union(CancelType) {
-                    all_io: Handle,
-                    completion: *Completion,
-                };
+                //pub const Cancel = union(CancelType) {
+                //    all_io: Handle,
+                //    completion: *Completion,
+                //};
 
                 // default
                 none: void,
@@ -1254,7 +1218,6 @@ pub fn Loop(comptime options: Options) type {
                 },
                 send: Send,
                 timeout: linux.kernel_timespec,
-                cancel: Cancel,
                 fds_update: FdsUpdate,
                 close: linux.fd_t,
             };
@@ -1389,72 +1352,6 @@ test "io_uring direct descriptors" {
             std.testing.expect(_fds[@intCast(res & std.math.maxInt(u31) - 1)] == 0) catch unreachable;
         }
     }.onUpdate);
-
-    try loop.run();
-}
-
-test "io_uring accept/connect/cancel" {
-    const DefaultLoop = Loop(.{});
-    const Completion = DefaultLoop.Completion;
-    const Socket = DefaultLoop.Socket;
-
-    var loop = try DefaultLoop.init();
-    defer loop.deinit();
-
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8081);
-
-    // create a listener socket
-    const server = try loop.tcpListener(addr, 128);
-    try loop.setReuseAddr(server);
-    try loop.setTcpNoDelay(server, true);
-
-    // start accepting connections
-    var accept_c = Completion{};
-    var cancel_c = Completion{};
-
-    // queue accepting
-    loop.accept(&accept_c, Completion, &cancel_c, server, struct {
-        fn onAccept(
-            _cancel_c: *Completion,
-            _loop: *DefaultLoop,
-            _accept_c: *Completion,
-            _: Socket,
-            result: DefaultLoop.AcceptError!Socket,
-        ) void {
-            const client = result catch |err| switch (err) {
-                error.Cancelled => {
-                    // expected after first accept
-                    std.testing.expectError(error.Cancelled, result) catch unreachable;
-                    return;
-                },
-                else => unreachable,
-            };
-            defer posix.close(client);
-
-            // stop accepting
-            _loop.cancel(.completion, _accept_c, _cancel_c);
-        }
-    }.onAccept);
-
-    // create a stream socket
-    const stream = try loop.tcpStream();
-    try loop.setTcpNoDelay(stream, true);
-
-    var connect_c = Completion{};
-
-    // queue a connect
-    loop.connect(Completion, &connect_c, &connect_c, stream, addr, struct {
-        fn onConnect(
-            _: *Completion,
-            _: *DefaultLoop,
-            _: *Completion,
-            _: Socket,
-            _: std.net.Address,
-            result: DefaultLoop.ConnectError!void,
-        ) void {
-            result catch unreachable;
-        }
-    }.onConnect);
 
     try loop.run();
 }
