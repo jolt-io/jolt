@@ -225,22 +225,9 @@ pub fn Loop(comptime options: Options) type {
                     true => ex.io_uring_prep_files_update(sqe, op.fds, op.offset),
                     false => unreachable,
                 },
-                .close => |fd| {
-                    if (comptime options.io_uring.direct_descriptors_mode) {
-                        sqe.prep_close_direct(@intCast(fd)); // works similar to fds_update
-                    } else {
-                        sqe.prep_close(fd);
-                    }
-
-                    // we'll allways set this to completion
-                    sqe.user_data = @intFromPtr(c);
-
-                    // FIXME: should I?
-                    // don't create a CQE for this
-                    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-
-                    // early return since we'll not increment the pending count
-                    return;
+                .close => |fd| switch (comptime options.io_uring.direct_descriptors_mode) {
+                    true => sqe.prep_close_direct(@intCast(fd)), // works similar to fds_update
+                    false => sqe.prep_close(fd),
                 },
             }
 
@@ -865,16 +852,28 @@ pub fn Loop(comptime options: Options) type {
             self.enqueue(completion);
         }
 
+        pub const HandleOrSocket = linux.fd_t;
+
         /// Queues a close operation.
         /// Supports both file descriptors and direct descriptors.
-        /// This operation doesn't invoke a callback, so the given descriptor must be considered invalid after this call.
-        pub fn close(self: *Self, completion: *Completion, fd: Handle) void {
+        pub fn close(
+            self: *Self,
+            completion: *Completion,
+            comptime T: type,
+            userdata: *T,
+            handle_or_socket: HandleOrSocket,
+            comptime callback: *const fn (
+                userdata: *T,
+                loop: *Self,
+                completion: *Completion,
+            ) void,
+        ) void {
             completion.* = .{
                 .next = null,
-                .operation = .{ .close = fd },
-                .userdata = null,
+                .operation = .{ .close = handle_or_socket },
+                .userdata = userdata,
                 .callback = comptime struct {
-                    fn wrap(_: *Self, c: *Completion) void {
+                    fn wrap(loop: *Self, c: *Completion) void {
                         const cqe = c.cqe.?;
                         const res = cqe.res;
 
@@ -885,6 +884,9 @@ pub fn Loop(comptime options: Options) type {
                             .INTR => {}, // This is still a success. See https://github.com/ziglang/zig/issues/2425
                             else => {},
                         }
+
+                        // execute the user provided callback
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c });
                     }
                 }.wrap,
             };
@@ -1144,7 +1146,6 @@ pub fn Loop(comptime options: Options) type {
                         .timeout => TimeoutError!void,
                         .fds_update => UpdateFdsError!i32,
                         .close => void,
-                        inline else => unreachable,
                     };
                 }
             };
@@ -1219,91 +1220,8 @@ pub fn Loop(comptime options: Options) type {
                 send: Send,
                 timeout: linux.kernel_timespec,
                 fds_update: FdsUpdate,
-                close: linux.fd_t,
+                close: HandleOrSocket,
             };
-
-            // Returns the result of this completion.
-            pub fn getResult(completion: *Completion, comptime op_type: OperationType) op_type.returnType() {
-                const cqe = completion.cqe.?;
-                const res = cqe.res;
-
-                switch (comptime op_type) {
-                    .none => unreachable,
-                    .read => unreachable,
-                    .write => unreachable,
-                    .connect => unreachable,
-                    .accept => {},
-                    .send => {
-                        // if zero-copy sends are activated, the result is held at `operation`
-                        const result = blk: {
-                            if (comptime options.io_uring.zero_copy_sends) {
-                                break :blk completion.operation.send.result;
-                            } else {
-                                break :blk res;
-                            }
-                        };
-
-                        if (result < 0) {
-                            return switch (@as(posix.E, @enumFromInt(-res))) {
-                                .INTR => unreachable, // TODO: this used to enqueue the completion again
-                                .ACCES => error.AccessDenied,
-                                .AGAIN => error.WouldBlock,
-                                .ALREADY => error.FastOpenAlreadyInProgress,
-                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
-                                .BADF => error.FileDescriptorInvalid,
-                                .CONNRESET => error.ConnectionResetByPeer,
-                                .DESTADDRREQ => unreachable,
-                                .FAULT => unreachable,
-                                .INVAL => unreachable,
-                                .ISCONN => unreachable,
-                                .MSGSIZE => error.MessageTooBig,
-                                .NOBUFS => error.SystemResources,
-                                .NOMEM => error.SystemResources,
-                                .NOTCONN => error.SocketNotConnected,
-                                .NOTSOCK => error.FileDescriptorNotASocket,
-                                .OPNOTSUPP => error.OperationNotSupported,
-                                .PIPE => error.BrokenPipe,
-                                .TIMEDOUT => error.ConnectionTimedOut,
-                                .CANCELED => error.Cancelled,
-                                else => |err| posix.unexpectedErrno(err),
-                            };
-                        } else {
-                            // valid length
-                            return @intCast(result);
-                        }
-                    },
-                    .recv => {
-                        // are you friend or foe
-                        if (res <= 0) {
-                            return switch (@as(posix.E, @enumFromInt(-res))) {
-                                .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
-                                //.INTR => return loop.enqueue(c), // we're interrupted, try again
-                                .INTR => unreachable,
-                                .AGAIN => error.WouldBlock,
-                                .BADF => error.Unexpected,
-                                .CONNREFUSED => error.ConnectionRefused,
-                                .FAULT => unreachable,
-                                .INVAL => unreachable,
-                                .NOBUFS => error.SystemResources,
-                                .NOMEM => error.SystemResources,
-                                .NOTCONN => error.SocketNotConnected,
-                                .NOTSOCK => error.Unexpected,
-                                .CONNRESET => error.ConnectionResetByPeer,
-                                .TIMEDOUT => error.ConnectionTimedOut,
-                                .OPNOTSUPP => error.OperationNotSupported,
-                                .CANCELED => error.Cancelled,
-                                else => error.Unexpected,
-                            };
-                        } else {
-                            // valid length
-                            return @intCast(res);
-                        }
-                    },
-                    inline else => unreachable,
-                }
-
-                unreachable;
-            }
         };
 
         // on unix, there's a unified fd type that's used for both sockets and file, pipe etc. handles.
@@ -1336,22 +1254,34 @@ test "io_uring direct descriptors" {
     try loop.setReuseAddr(server);
     try loop.setTcpNoDelay(server, true);
 
-    var update_descriptors_c = Completion{};
-    var fds = [_]linux.fd_t{server};
+    try loop.updateDescriptorsSync(0, &[_]linux.fd_t{server});
 
-    loop.updateDescriptorsAsyncAlloc(&update_descriptors_c, Completion, &update_descriptors_c, &fds, struct {
-        fn onUpdate(
-            _: *Completion,
-            _: *DefaultLoop,
-            _: *Completion,
-            _fds: []linux.fd_t,
-            result: DefaultLoop.UpdateFdsError!i32,
-        ) void {
-            const res = result catch unreachable;
-            std.testing.expect(res == 1) catch unreachable;
-            std.testing.expect(_fds[@intCast(res & std.math.maxInt(u31) - 1)] == 0) catch unreachable;
+    //var update_descriptors_c = Completion{};
+    //var fds = [_]linux.fd_t{server};
+
+    var close_c = Completion{};
+
+    loop.close(&close_c, Completion, &close_c, 0, struct {
+        fn onClose(_: *Completion, _: *DefaultLoop, _: *Completion) void {
+            std.debug.print("finished!\n", .{});
         }
-    }.onUpdate);
+    }.onClose);
+
+    //loop.close(completion: *Completion, fd: Handle);
+
+    //loop.updateDescriptorsAsyncAlloc(&update_descriptors_c, Completion, &update_descriptors_c, &fds, struct {
+    //    fn onUpdate(
+    //        _: *Completion,
+    //        _: *DefaultLoop,
+    //        _: *Completion,
+    //        _fds: []linux.fd_t,
+    //        result: DefaultLoop.UpdateFdsError!i32,
+    //    ) void {
+    //        const res = result catch unreachable;
+    //        std.testing.expect(res == 1) catch unreachable;
+    //        std.testing.expect(_fds[@intCast(res & std.math.maxInt(u31) - 1)] == 0) catch unreachable;
+    //    }
+    //}.onUpdate);
 
     try loop.run();
 }
