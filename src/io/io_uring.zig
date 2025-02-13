@@ -592,6 +592,7 @@ pub fn Loop(comptime options: Options) type {
                 completion: *Completion,
                 socket: Socket,
                 buffer: []u8,
+                result: RecvError!usize,
             ) void,
         ) void {
             completion.* = .{
@@ -605,10 +606,31 @@ pub fn Loop(comptime options: Options) type {
                 .userdata = userdata,
                 .callback = struct {
                     fn wrap(loop: *Self, c: *Completion) void {
-                        const op = c.operation.recv;
+                        const cqe = c.cqe.?;
+                        const res = cqe.res;
 
-                        // regular buffer version
-                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer });
+                        const result: RecvError!usize = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
+                            .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
+                            .INTR => return loop.enqueue(c), // we're interrupted, try again
+                            .INTR => unreachable,
+                            .AGAIN => error.WouldBlock,
+                            .BADF => error.Unexpected,
+                            .CONNREFUSED => error.ConnectionRefused,
+                            .FAULT => unreachable,
+                            .INVAL => unreachable,
+                            .NOBUFS => error.SystemResources,
+                            .NOMEM => error.SystemResources,
+                            .NOTCONN => error.SocketNotConnected,
+                            .NOTSOCK => error.Unexpected,
+                            .CONNRESET => error.ConnectionResetByPeer,
+                            .TIMEDOUT => error.ConnectionTimedOut,
+                            .OPNOTSUPP => error.OperationNotSupported,
+                            .CANCELED => error.Cancelled,
+                            else => error.Unexpected,
+                        } else @intCast(res); // valid
+
+                        const op = c.operation.recv;
+                        @call(.always_inline, callback, .{ @as(*T, @ptrCast(@alignCast(c.userdata))), loop, c, op.socket, op.buffer, result });
                     }
                 }.wrap,
             };
