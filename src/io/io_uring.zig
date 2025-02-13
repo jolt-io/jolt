@@ -612,7 +612,6 @@ pub fn Loop(comptime options: Options) type {
                         const result: RecvError!usize = if (res <= 0) switch (@as(posix.E, @enumFromInt(-res))) {
                             .SUCCESS => error.EndOfStream, // 0 reads are interpreted as errors
                             .INTR => return loop.enqueue(c), // we're interrupted, try again
-                            .INTR => unreachable,
                             .AGAIN => error.WouldBlock,
                             .BADF => error.Unexpected,
                             .CONNREFUSED => error.ConnectionRefused,
