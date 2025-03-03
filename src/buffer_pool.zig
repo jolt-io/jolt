@@ -23,7 +23,7 @@ pub fn BufferPool(comptime io_engine: IoEngine) type {
             /// Pointer to the memory shared by the kernel.
             /// `buffer_count` of `io_uring_buf` structures are shared by the kernel.
             /// First `io_uring_buf` is overlaid by `io_uring_buf_ring` struct.
-            buffer_ring: *align(mem.page_size) io_uring_buf_ring,
+            buffer_ring: *align(std.heap.page_size_min) io_uring_buf_ring,
             /// Contiguous block of memory of size (buffer_size * buffer_count).
             pool: [*]u8,
             /// Size of each buffer in buffers.
