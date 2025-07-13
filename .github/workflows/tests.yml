@@ -7,21 +7,22 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest]
-        target: [
-          #aarch64-linux-gnu,
-          #aarch64-linux-musl,
-          #riscv64-linux-gnu,
-          #rsicv64-linux-musl,
-          x86_64-linux-gnu,
-          x86_64-linux-musl,
-        ]
+        target:
+          [
+            aarch64-linux-gnu,
+            aarch64-linux-musl,
+            riscv64-linux-gnu,
+            rsicv64-linux-musl,
+            x86_64-linux-gnu,
+            x86_64-linux-musl,
+          ]
     runs-on: ${{ matrix.os }}
     name: Build and Test ${{ matrix.os }}, ${{ matrix.target }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # github VMs only support x64 for now so we need QEMU
+      # GitHub VMs only support x64 for now so we need QEMU.
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
         with:
@@ -29,9 +30,9 @@ jobs:
           cache-image: true
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0-dev.3357+c44f4501e
+          version: 0.14.1
 
       - name: Run Tests
         run: zig build test -Dtarget=${{ matrix.target }} -fqemu

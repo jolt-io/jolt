@@ -1,7 +1,11 @@
-// Code here is heavily based on both tigerbeetle/io and libxev.
-// Thanks TigerBeetle team and @mitchellh!
-// https://github.com/tigerbeetle/tigerbeetle/blob/main/src/io/linux.zig
-// https://github.com/mitchellh/libxev/blob/main/src/backend/io_uring.zig
+//! io_uring backend.
+//!
+//! Code here is heavily based on both tigerbeetle/io and libxev.
+//! Thanks TigerBeetle team and @mitchellh!
+//!
+//! https://github.com/tigerbeetle/tigerbeetle/blob/main/src/io/linux.zig
+//! https://github.com/mitchellh/libxev/blob/main/src/backend/io_uring.zig
+
 const std = @import("std");
 const os = std.os;
 const assert = std.debug.assert;
@@ -11,24 +15,24 @@ const IO_Uring = linux.IoUring;
 const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
 const Intrusive = @import("../queue.zig").Intrusive;
-const Options = @import("options.zig").Options;
 const BufferPool = @import("../buffer_pool.zig").BufferPool(.io_uring);
+const Options = @import("options.zig").Options;
 const ex = @import("linux/io_uring_ex.zig");
 
 /// Event notifier implementation based on io_uring.
-/// FIXME: Add error types
+/// FIXME: Add error types.
 pub fn Loop(comptime options: Options) type {
     return struct {
         const Self = @This();
-        /// io_uring instance
+        /// io_uring instance.
         ring: IO_Uring,
         /// count of CQEs that we're waiting to receive, includes;
         /// * I/O operations that're submitted successfully (not in unqueued),
         /// * I/O operations that create multiple CQEs (multishot operations, zero-copy send etc.).
         io_pending: u32 = 0,
-        /// I/O operations that're not queued yet
+        /// I/O operations that're not queued yet.
         unqueued: Intrusive(Completion) = .{},
-        /// Completions that're ready for their callbacks to run
+        /// Completions that're ready for their callbacks to run.
         completed: Intrusive(Completion) = .{},
 
         /// TODO: Check io_uring capabilities of kernel.
