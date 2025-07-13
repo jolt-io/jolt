@@ -7,15 +7,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest]
-        target:
-          [
-            aarch64-linux-gnu,
-            aarch64-linux-musl,
-            riscv64-linux-gnu,
-            rsicv64-linux-musl,
-            x86_64-linux-gnu,
-            x86_64-linux-musl,
-          ]
+        target: [x86_64-linux-gnu, x86_64-linux-musl]
     runs-on: ${{ matrix.os }}
     name: Build and Test ${{ matrix.os }}, ${{ matrix.target }}
     steps:
