@@ -47,7 +47,7 @@ pub fn Intrusive(comptime T: type) type {
                 self.head = v;
             } else {
                 // NOTE: we assume the next field is set to null, otherwise it can lead to bugs.
-                //v.next = null;
+                v.next = null;
                 self.head = v;
                 self.tail = v;
             }
