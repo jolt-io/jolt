@@ -504,6 +504,7 @@ pub const IoUring = struct {
         OperationNotSupported,
         BrokenPipe,
         ConnectionTimedOut,
+        ConnectionRefused,
     } || CancelationError || UnexpectedError;
 
     /// Queues a send operation.
