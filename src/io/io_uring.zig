@@ -538,7 +538,7 @@ pub const IoUring = struct {
                     const res = _completion.result;
 
                     const result = if (res < 0) switch (_completion.err()) {
-                        .INTR => return _loop.enqueue(completion),
+                        .INTR => return _loop.enqueue(_completion),
                         .ACCES => error.AccessDenied,
                         .AGAIN => unreachable,
                         .ALREADY => error.FastOpenAlreadyInProgress,
