@@ -72,6 +72,21 @@ pub fn Intrusive(comptime T: type) type {
             return next;
         }
 
+        /// Removes the top node. Assumes such node exist.
+        pub inline fn removeAssumeHead(self: *Self) void {
+            const top_node = self.head orelse unreachable;
+            // Last node.
+            if (top_node == self.tail) self.tail = null;
+            // Update head.
+            self.head = top_node.next;
+            top_node.next = null;
+        }
+
+        /// Return the element on top but don't remove it.
+        pub inline fn peek(self: *const Self) ?*T {
+            return self.head;
+        }
+
         /// Returns true if the queue is empty.
         pub fn isEmpty(self: *const Self) bool {
             return self.head == null;
