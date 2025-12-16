@@ -39,14 +39,14 @@ pub fn kevent(
     unreachable;
 }
 
-pub fn getsockoptError(sockfd: posix.fd_t) i32 {
+pub fn getsockoptError(sockfd: posix.fd_t) posix.E {
     var err_code: i32 = undefined;
     var size: u32 = @sizeOf(u32);
     const rc = system.getsockopt(sockfd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&err_code), &size);
     std.debug.assert(size == 4);
     // If rc is 0 (.SUCCESS), `err_code` indicates an error.
     return switch (posix.errno(rc)) {
-        .SUCCESS => err_code,
+        .SUCCESS => @enumFromInt(err_code),
         else => unreachable,
     };
 }

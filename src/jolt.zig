@@ -1,5 +1,4 @@
 const std = @import("std");
-const testing = std.testing;
 const builtin = @import("builtin");
 
 /// Default loop for the given arch.
@@ -11,6 +10,7 @@ pub const Loop = switch (builtin.os.tag) {
 
 pub const Queue = @import("queue.zig").Intrusive;
 
+const testing = std.testing;
 test {
     testing.refAllDecls(Loop);
 }
