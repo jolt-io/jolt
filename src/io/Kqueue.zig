@@ -50,6 +50,50 @@ pub fn socket(
     loop.submissions.push(handle);
 }
 
+/// Calls `on_done` for each incoming handle.
+pub fn acceptStart(
+    loop: *Loop,
+    completion: *Completion,
+    comptime T: type,
+    userdata: *T,
+    handle: *Handle,
+    comptime on_done: *const fn (
+        userdata: *T,
+        loop: *Loop,
+        completion: *Completion,
+        handle: *Handle,
+        result: posix.AcceptError!posix.socket_t,
+    ) void,
+) void {
+    completion.* = .{
+        .next = null,
+        .userdata = userdata,
+        .callback = @ptrCast(&(struct {
+            fn wrap(c: *Completion, l: *Loop, h: *Handle) void {
+                const data = c.data.accept;
+
+                @call(
+                    .always_inline,
+                    on_done,
+                    .{ c.userdatum(T), l, c, h, data.sockfd },
+                );
+            }
+        }.wrap)),
+        .data = .{
+            .accept = .{
+                .addr = undefined,
+                .socklen = 0,
+                .sockfd = invalid_fd,
+            },
+        },
+        .type = .accept,
+        .err = @enumFromInt(0),
+    };
+
+    handle.read_queue.push(completion);
+    loop.io_pending += 1;
+}
+
 /// Queues a connect operation.
 pub fn connect(
     loop: *Loop,
@@ -261,6 +305,30 @@ fn registerHandles(loop: *Loop, events: []sys.Kevent) usize {
 fn performRecvs(loop: *Loop, handle: *Handle) void {
     run_reads: while (handle.read_queue.peek()) |c| {
         switch (c.type) {
+            .accept => {
+                // Accept until blocked.
+                while (true) {
+                    const data = &c.data.accept;
+                    // TODO: Handle error.
+                    // Accept a socket.
+                    const rc = system.accept(handle.fd, &data.addr, &data.socklen);
+                    switch (posix.errno(rc)) {
+                        .SUCCESS => {
+                            // Configure socket fd.
+                            const sockfd: posix.socket_t = @intCast(rc);
+                            const flags = posix.fcntl(sockfd, posix.F.GETFL, 0) catch 0 | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+                            _ = posix.fcntl(sockfd, posix.F.SETFL, flags) catch unreachable;
+                            // Let completion know about socket.
+                            data.sockfd = sockfd;
+                            // Run a callback for this.
+                            c.execute(loop, handle);
+                        },
+                        .INTR => continue,
+                        .AGAIN => break,
+                        else => @panic("TODO: darwin accept error"),
+                    }
+                }
+            },
             .recv => {
                 const data = c.data.rw;
                 const bytes_read: usize = blk: while (true) {
@@ -399,6 +467,8 @@ pub fn run(loop: *Loop, comptime mode: RunMode) !void {
 }
 
 pub const Handle = struct {
+    pub const invalid = Handle{ .fd = invalid_fd };
+
     next: ?*Handle = null,
     //prev: ?*Handle = null,
     fd: posix.fd_t = invalid_fd,
@@ -428,6 +498,7 @@ pub const Completion = extern struct {
 
     pub const Type = enum(u8) {
         none = 0,
+        accept,
         connect,
         recv,
         send,
@@ -438,6 +509,11 @@ pub const Completion = extern struct {
     /// Operation specific data of Completion.
     pub const Data = extern union {
         none: void,
+        accept: extern struct {
+            addr: posix.sockaddr,
+            socklen: posix.socklen_t,
+            sockfd: posix.socket_t,
+        },
         rw: extern struct {
             base: [*]u8,
             len: usize,
@@ -499,6 +575,7 @@ pub const Completion = extern struct {
     fn Result(comptime completion_type: Type) type {
         return switch (completion_type) {
             .none => unreachable,
+            .accept => unreachable,
             .connect => posix.ConnectError!void,
             .recv, .recvfrom => posix.RecvFromError!usize,
             .send => posix.SendError!usize,
@@ -515,6 +592,7 @@ pub const Completion = extern struct {
     ) Result(completion_type) {
         return switch (completion_type) {
             .none => unreachable,
+            .accept => unreachable,
             .connect => switch (completion.err) {
                 .SUCCESS => {},
                 .ACCES => error.AccessDenied,
