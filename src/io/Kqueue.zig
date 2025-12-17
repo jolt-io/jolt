@@ -70,18 +70,18 @@ pub fn acceptStart(
         .userdata = userdata,
         .callback = @ptrCast(&(struct {
             fn wrap(c: *Completion, l: *Loop, h: *Handle) void {
-                const data = c.data.accept;
+                const result = c.result(.accept);
 
                 @call(
                     .always_inline,
                     on_done,
-                    .{ c.userdatum(T), l, c, h, data.sockfd },
+                    .{ c.userdatum(T), l, c, h, result },
                 );
             }
         }.wrap)),
         .data = .{
             .accept = .{
-                .addr = undefined,
+                .addr = std.mem.zeroes(posix.sockaddr),
                 .socklen = 0,
                 .sockfd = invalid_fd,
             },
@@ -305,6 +305,7 @@ fn registerHandles(loop: *Loop, events: []sys.Kevent) usize {
 fn performRecvs(loop: *Loop, handle: *Handle) void {
     run_reads: while (handle.read_queue.peek()) |c| {
         switch (c.type) {
+            // TODO: Currently its not possible to stop this lol, requires cancelation support.
             .accept => {
                 // Accept until blocked.
                 while (true) {
@@ -320,13 +321,13 @@ fn performRecvs(loop: *Loop, handle: *Handle) void {
                             _ = posix.fcntl(sockfd, posix.F.SETFL, flags) catch unreachable;
                             // Let completion know about socket.
                             data.sockfd = sockfd;
-                            // Run a callback for this.
-                            c.execute(loop, handle);
                         },
-                        .INTR => continue,
-                        .AGAIN => break,
-                        else => @panic("TODO: darwin accept error"),
+                        .INTR => continue, // Try immediately.
+                        .AGAIN => return, // Try some other time.
+                        else => |err| c.err = err,
                     }
+
+                    c.execute(loop, handle);
                 }
             },
             .recv => {
@@ -362,9 +363,6 @@ fn performSends(loop: *Loop, handle: *Handle) void {
                 // we have to check for errors once socket is
                 // writable.
                 c.err = sys.getsockoptError(handle.fd);
-                handle.write_queue.removeAssumeHead();
-                loop.io_pending -= 1;
-                c.execute(loop, handle);
             },
             .send => {
                 const data = &c.data.rw_const;
@@ -376,29 +374,30 @@ fn performSends(loop: *Loop, handle: *Handle) void {
                         switch (posix.errno(rc)) {
                             .SUCCESS => break :blk @intCast(rc), // Written bytes.
                             .INTR => continue, // Interrupted.
-                            .AGAIN => break :write_all, // Continue some other time.
+                            .AGAIN => return, // Continue some other time.
                             else => |err| {
                                 c.err = err;
-                                break :blk 0;
+                                break :write_all;
                             },
                         }
                     };
 
                     data.written += written;
                 }
-
-                // Execute.
-                handle.write_queue.removeAssumeHead();
-                loop.io_pending -= 1;
-                c.execute(loop, handle);
             },
             else => unreachable,
         }
+
+        // Remove from the queue.
+        handle.write_queue.removeAssumeHead();
+        loop.io_pending -= 1;
+        // Perform.
+        c.execute(loop, handle);
     }
 }
 
 /// Single tick of event loop.
-/// If blocking is true, kevent syscall will wait indefinitely.
+/// If `blocking` is true, kevent syscall will wait indefinitely.
 fn tick(loop: *Loop, comptime blocking: bool) !void {
     // Run events that're completed before tick.
     // Copy is necessary to inhibit recursion.
@@ -489,9 +488,9 @@ pub const Completion = extern struct {
     callback: ?*const anyopaque = null,
     /// Active payload.
     type: Type = .none,
-    /// TODO: Implement this to be on par with io_uring backend.
-    active: bool = false,
+    /// Error payload of this completion.
     err: posix.E = @enumFromInt(0),
+    /// Reserved.
     __pad: u32 = 0,
     /// Varying operation data; this is specific to operation kind.
     data: Data = .{ .none = {} },
@@ -575,7 +574,7 @@ pub const Completion = extern struct {
     fn Result(comptime completion_type: Type) type {
         return switch (completion_type) {
             .none => unreachable,
-            .accept => unreachable,
+            .accept => posix.AcceptError!posix.socket_t,
             .connect => posix.ConnectError!void,
             .recv, .recvfrom => posix.RecvFromError!usize,
             .send => posix.SendError!usize,
@@ -592,7 +591,24 @@ pub const Completion = extern struct {
     ) Result(completion_type) {
         return switch (completion_type) {
             .none => unreachable,
-            .accept => unreachable,
+            .accept => switch (completion.err) {
+                .SUCCESS => completion.data.accept.sockfd,
+                .INTR => unreachable, // Already handled.
+                .AGAIN => unreachable, // Already handled.
+                .BADF => unreachable, // always a race condition
+                .CONNABORTED => error.ConnectionAborted,
+                .FAULT => unreachable,
+                .INVAL => error.SocketNotListening,
+                .NOTSOCK => unreachable,
+                .MFILE => error.ProcessFdQuotaExceeded,
+                .NFILE => error.SystemFdQuotaExceeded,
+                .NOBUFS => error.SystemResources,
+                .NOMEM => error.SystemResources,
+                .OPNOTSUPP => unreachable,
+                .PROTO => error.ProtocolFailure,
+                .PERM => error.BlockedByFirewall,
+                else => |err| posix.unexpectedErrno(err),
+            },
             .connect => switch (completion.err) {
                 .SUCCESS => {},
                 .ACCES => error.AccessDenied,
