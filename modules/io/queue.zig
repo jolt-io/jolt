@@ -93,3 +93,101 @@ pub fn Intrusive(comptime T: type) type {
         }
     };
 }
+
+/// An intrusive thread-unsafe doubly-linked queue of items.
+/// `T` must have fields `next` and `prev` with type `?*T`.
+pub fn DoublyLinked(comptime T: type) type {
+    comptime {
+        std.debug.assert(@FieldType(T, "next") == ?*T and @FieldType(T, "prev") == ?*T);
+    }
+
+    return extern struct {
+        const Queue = @This();
+        head: ?*T = null,
+        tail: ?*T = null,
+
+        /// Returns true if queue is empty.
+        pub inline fn isEmpty(queue: *const Queue) bool {
+            return queue.head == null;
+        }
+
+        /// Adds an element to the end of the queue.
+        pub fn push(queue: *Queue, item: *T) void {
+            if (queue.tail) |tail| {
+                tail.next = item;
+                item.prev = tail;
+                // Reset item.
+                item.next = null;
+                queue.tail = item;
+            } else {
+                // Reset item.
+                item.prev = null;
+                item.next = null;
+                // If queue don't have a tail, this is the first element.
+                queue.head = item;
+                queue.tail = item;
+            }
+        }
+
+        /// Removes an element from the queue.
+        pub fn remove(queue: *Queue, item: *T) void {
+            if (item.prev) |prev_item| {
+                prev_item.next = item.next;
+            } else {
+                // Item was the head.
+                queue.head = item.next;
+            }
+
+            if (item.next) |next_item| {
+                next_item.prev = item.prev;
+            } else {
+                // Item was the tail.
+                queue.tail = item.prev;
+            }
+
+            // Reset removed element.
+            item.next = null;
+            item.prev = null;
+        }
+
+        /// Pops the first element from the queue.
+        pub fn popFirst(queue: *Queue) ?*T {
+            const head = queue.head orelse return null;
+
+            // This is the only element in the queue.
+            if (head == queue.tail.?) {
+                queue.head = null;
+                queue.tail = null;
+            } else {
+                const next = head.next.?;
+                queue.head = next;
+                next.prev = null;
+            }
+
+            // Reset popped element.
+            head.next = null;
+            head.prev = null;
+            return head;
+        }
+
+        /// Pops the last element from the queue.
+        pub fn popLast(queue: *Queue) ?*T {
+            const tail = queue.tail orelse return null;
+
+            // This is the only element in the queue.
+            if (tail == queue.head.?) {
+                queue.head = null;
+                queue.tail = null;
+            } else {
+                const prev = tail.prev.?;
+                queue.tail = prev;
+                prev.next = null;
+            }
+
+            // Reset popped element.
+            tail.next = null;
+            tail.prev = null;
+            return tail;
+        }
+    };
+}

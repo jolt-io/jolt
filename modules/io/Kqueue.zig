@@ -7,7 +7,7 @@ const os = std.os;
 const posix = std.posix;
 const system = posix.system;
 
-const queue = @import("../queue.zig");
+const queue = @import("queue.zig");
 const sys = @import("bsd/sys.zig");
 
 const invalid_fd: posix.fd_t = -1;
@@ -15,12 +15,14 @@ const invalid_fd: posix.fd_t = -1;
 const Loop = @This();
 /// kqueue instance.
 kq: posix.fd_t,
-/// Count of pending operations.
-io_pending: usize = 0,
-/// Handles waiting for registration.
-/// Helps batching registration and
-submissions: queue.Intrusive(Handle) = .{},
-/// Operations completed and ready for their callbacks to be run.
+/// Changes pending to be executed.
+/// This tracks registers/deregisters, and I/O events we're interested.
+changes: [256]sys.Kevent = undefined,
+/// Points to next writable spot in `changes`.
+changes_idx: u32 = 0,
+/// Queue of registered handles.
+registered: queue.DoublyLinked(Handle) = .{},
+/// Operations completed inline or out of kqueue bounds and ready for their callbacks to be run.
 /// We could execute callbacks in-place but it may cause unbounded stack usage.
 completed: queue.Intrusive(Completion) = .{},
 
@@ -35,24 +37,86 @@ pub fn deinit(loop: *Loop) void {
     posix.close(loop.kq);
 }
 
-pub fn socket(
+/// Advances the `changes_idx` by 1. Wraps around if index >= changes slice length.
+fn advanceChanges(loop: *Loop) !void {
+    loop.changes_idx = (loop.changes_idx + 1) % @as(u32, loop.changes.len);
+    if (loop.changes_idx == 0) {
+        // Changes index wrapped around, we have to flush.
+        // Don't receive events here though; we want to do it in next tick.
+        const len = try sys.kevent(loop.kq, &loop.changes, @constCast(&.{}), &posix.timespec{ .nsec = 0, .sec = 0 });
+        std.debug.assert(len == 0);
+    }
+}
+
+pub fn enable(loop: *Loop, handle: *Handle) !void {
+    // Handle is being used by this loop.
+    loop.registered.push(handle);
+    // Prepare monitoring entries.
+    const filters = .{ system.EVFILT.READ, system.EVFILT.WRITE };
+    inline for (filters) |filter| {
+        loop.changes[loop.changes_idx] = .{
+            .ident = @intCast(handle.fd),
+            .filter = filter,
+            .flags = Event.Add | Event.Enable,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(handle),
+            .ext = undefined,
+        };
+
+        try loop.advanceChanges();
+    }
+}
+
+pub fn disable(loop: *Loop, handle: *Handle) !void {
+    const filters = .{ system.EVFILT.READ, system.EVFILT.WRITE };
+    inline for (filters) |filter| {
+        loop.changes[loop.changes_idx] = .{
+            .ident = @intCast(handle.fd),
+            .filter = filter,
+            .flags = Event.Add | Event.Disable,
+            .fflags = 0,
+            .data = 0,
+            .udata = @intFromPtr(handle),
+            .ext = undefined,
+        };
+
+        try loop.advanceChanges();
+    }
+
+    // Unregister from the loop.
+    loop.registered.remove(handle);
+
+    // Cancel reads.
+    while (handle.read_queue.pop()) |c| {
+        c.err = .CANCELED;
+        c.execute(loop, handle);
+    }
+    // Cancel writes.
+    while (handle.write_queue.pop()) |c| {
+        c.err = .CANCELED;
+        c.execute(loop, handle);
+    }
+}
+
+pub fn initSocket(
     loop: *Loop,
     handle: *Handle,
     domain: u32,
     socket_type: u32,
     protocol: u32,
 ) !void {
-    // Prepare handle.
+    // Create a socket.
     const flags = socket_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
     const fd = try posix.socket(domain, flags, protocol);
     handle.* = .{ .fd = fd };
-    // Handle will be registered to kq by the next iteration of `run`.
-    loop.submissions.push(handle);
+
+    return loop.enable(handle);
 }
 
 /// Calls `on_done` for each incoming handle.
 pub fn acceptStart(
-    loop: *Loop,
+    _: *Loop,
     completion: *Completion,
     comptime T: type,
     userdata: *T,
@@ -91,7 +155,6 @@ pub fn acceptStart(
     };
 
     handle.read_queue.push(completion);
-    loop.io_pending += 1;
 }
 
 /// Queues a connect operation.
@@ -150,7 +213,6 @@ pub fn connect(
                 // write requests after this one. Meaning connect has
                 // higher prio.
                 handle.write_queue.unshift(completion);
-                loop.io_pending += 1;
                 return;
             },
             // Encountered with an error; push to `completed` w/ error.
@@ -168,7 +230,7 @@ pub fn connect(
 
 /// Queue a send operation.
 pub fn send(
-    loop: *Loop,
+    _: *Loop,
     completion: *Completion,
     comptime T: type,
     userdata: *T,
@@ -213,12 +275,11 @@ pub fn send(
     };
 
     handle.write_queue.push(completion);
-    loop.io_pending += 1;
 }
 
 /// Queue a recv operation.
 pub fn recv(
-    loop: *Loop,
+    _: *Loop,
     completion: *Completion,
     comptime T: type,
     userdata: *T,
@@ -262,42 +323,10 @@ pub fn recv(
     };
 
     handle.read_queue.push(completion);
-    loop.io_pending += 1;
 }
 
 pub inline fn hasIo(loop: *const Loop) bool {
-    return !loop.submissions.isEmpty() or loop.io_pending > 0 or !loop.completed.isEmpty();
-}
-
-/// Populates `events`, returns a length of events put.
-fn registerHandles(loop: *Loop, events: []sys.Kevent) usize {
-    var i: usize = 0;
-    while (i < events.len) : (i += 2) {
-        const handle = loop.submissions.pop() orelse break;
-        std.debug.assert(handle.fd >= 0);
-        // Watch for read events.
-        events[i] = .{
-            .ident = @intCast(handle.fd),
-            .filter = system.EVFILT.READ,
-            .flags = system.EV.ADD | system.EV.ENABLE,
-            .fflags = 0,
-            .data = 0,
-            .udata = @intFromPtr(handle),
-            .ext = undefined,
-        };
-        // Watch for write events.
-        events[i + 1] = .{
-            .ident = @intCast(handle.fd),
-            .filter = system.EVFILT.WRITE,
-            .flags = system.EV.ADD | system.EV.ENABLE,
-            .fflags = 0,
-            .data = 0,
-            .udata = @intFromPtr(handle),
-            .ext = undefined,
-        };
-    }
-
-    return i;
+    return loop.changes_idx > 0 or !loop.registered.isEmpty() or !loop.completed.isEmpty();
 }
 
 /// Perform recv operations of a handle.
@@ -324,7 +353,12 @@ fn performRecvs(loop: *Loop, handle: *Handle) void {
                         },
                         .INTR => continue, // Try immediately.
                         .AGAIN => return, // Try some other time.
-                        else => |err| c.err = err,
+                        else => |err| {
+                            handle.read_queue.removeAssumeHead();
+                            c.err = err;
+                            c.execute(loop, handle);
+                            return;
+                        },
                     }
 
                     c.execute(loop, handle);
@@ -338,12 +372,14 @@ fn performRecvs(loop: *Loop, handle: *Handle) void {
                         .SUCCESS => break :blk @intCast(rc),
                         .INTR => continue,
                         .AGAIN => break :run_reads, // Continue some other time.
-                        else => |err| c.err = err,
+                        else => |err| {
+                            c.err = err;
+                            break :blk 0;
+                        },
                     }
                 };
                 // Completion can be executed now, remove from the queue.
                 handle.read_queue.removeAssumeHead();
-                loop.io_pending -= 1;
                 // Execute.
                 c.data.rw.bytes_read = bytes_read;
                 c.execute(loop, handle);
@@ -390,7 +426,6 @@ fn performSends(loop: *Loop, handle: *Handle) void {
 
         // Remove from the queue.
         handle.write_queue.removeAssumeHead();
-        loop.io_pending -= 1;
         // Perform.
         c.execute(loop, handle);
     }
@@ -398,7 +433,7 @@ fn performSends(loop: *Loop, handle: *Handle) void {
 
 /// Single tick of event loop.
 /// If `blocking` is true, kevent syscall will wait indefinitely.
-fn tick(loop: *Loop, comptime blocking: bool) !void {
+pub fn tick(loop: *Loop, comptime blocking: bool) !void {
     // Run events that're completed before tick.
     // Copy is necessary to inhibit recursion.
     var completed = loop.completed;
@@ -409,13 +444,14 @@ fn tick(loop: *Loop, comptime blocking: bool) !void {
         c.execute(loop, c.data.connect.handle);
     }
 
+    const changes = loop.changes[0..loop.changes_idx];
+    loop.changes_idx = 0;
+    // Can't use the same buffer since it may get overwritten by completion callbacks.
     var events: [256]sys.Kevent = undefined;
-    // This populates `events` with read and write events.
-    const events_len = loop.registerHandles(&events);
     // Register handles & receive ready events together.
     const ready_len = try sys.kevent(
         loop.kq,
-        events[0..events_len],
+        changes,
         &events,
         // NULL cause kevent to wait indefinitely,
         // zeroed timeout cause polling.
@@ -436,45 +472,75 @@ fn tick(loop: *Loop, comptime blocking: bool) !void {
 
 pub const RunMode = enum {
     /// Runs the event loop once; this may or may not complete events.
-    ///
-    /// Useful for using event loop in other loops.
+    /// Might block until a single operation has finished.
     once,
+    /// Runs the event loop once; this may or may not complete events.
+    /// Only interested with events that're ready now; never blocks.
+    non_blocking,
     /// Runs the event loop until all operations are completed, blocks
     /// the process if needed.
-    ///
-    /// Useful if this is the only loop program use.
-    complete,
+    until_done,
 };
 
 /// Runs the event loop by desired mode.
 pub fn run(loop: *Loop, comptime mode: RunMode) !void {
     switch (mode) {
-        .once => {
-            // Nothing to do.
-            if (!loop.hasIo()) {
-                return;
-            }
-            try loop.tick(false);
-        },
-        .complete => {
-            // Keep running till finish.
-            while (loop.hasIo()) {
-                try loop.tick(true);
-            }
-        },
+        .once => if (loop.hasIo()) try loop.tick(true),
+        .non_blocking => if (loop.hasIo()) try loop.tick(false),
+        .until_done => while (loop.hasIo()) try loop.tick(true),
     }
 }
 
-pub const Handle = struct {
-    pub const invalid = Handle{ .fd = invalid_fd };
+const Event = struct {
+    const Add = system.EV.ADD;
+    const Delete = system.EV.DELETE;
+    const Enable = system.EV.ENABLE;
+    const Disable = system.EV.DISABLE;
+    const OneShot = system.EV.ONESHOT;
+    const Clear = system.EV.CLEAR;
+};
 
+pub const Handle = struct {
     next: ?*Handle = null,
-    //prev: ?*Handle = null,
+    prev: ?*Handle = null,
+    /// File descriptor belong to handle.
     fd: posix.fd_t = invalid_fd,
+    /// Used when (de)registering a handle to loop.
+    loop_flags: u16 = 0,
+    state: enum(u8) {
+        /// Free from all loops; can be registered again.
+        unregistered = 0,
+        /// In update queue; no need to queue again. `loop_flags` can be modified though.
+        in_queue,
+        /// Registered to a loop.
+        registered,
+        /// Handle is about to close.
+        closing,
+        /// Handle is closed.
+        closed,
+    } = .unregistered,
     /// Linked list of write and connect operations.
     write_queue: queue.Intrusive(Completion) = .{},
     /// Linked list of read and accept operations.
     read_queue: queue.Intrusive(Completion) = .{},
+
+    pub const invalid = Handle{ .fd = invalid_fd };
+
+    pub inline fn setReuseAddr(handle: *const Handle, toggle: bool) !void {
+        return posix.setsockopt(handle.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, @intFromBool(toggle))));
+    }
+
+    pub inline fn bind(handle: *const Handle, addr: std.net.Address) !void {
+        return posix.bind(handle.fd, &addr.any, addr.getOsSockLen());
+    }
+
+    pub inline fn listen(handle: *const Handle, kernel_backlog: u31) !void {
+        return posix.listen(handle.fd, kernel_backlog);
+    }
+
+    pub fn format(handle: Handle, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return writer.print("Handle{{ .fd = {} }}", .{handle.fd});
+    }
 };
 
 /// Represents a single operation.
@@ -552,6 +618,10 @@ pub const Completion = extern struct {
     /// Internal.
     /// Type of type-erased `callback`.
     pub const Callback = *const fn (completion: *Completion, loop: *Loop, handle: *Handle) void;
+
+    pub fn format(completion: Completion, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return writer.print("Completion{{ .type = {s} }}", .{@tagName(completion.type)});
+    }
 
     /// Internal function.
     /// `userdata` with a type.
@@ -732,6 +802,40 @@ test "basic" {
             result: posix.RecvFromError!usize,
         ) void {
             std.debug.print("{s}\n", .{slice[0 .. result catch unreachable]});
+        }
+    }.on_done);
+
+    try loop.run(.complete);
+}
+
+test "TCP server" {
+    var loop = try Loop.init();
+    defer loop.deinit();
+
+    // Setup listener.
+    var handle = Handle{};
+    try loop.socket(&handle, posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
+    defer posix.close(handle.fd);
+    try posix.setsockopt(handle.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8081);
+    try posix.bind(handle.fd, &addr.any, addr.getOsSockLen());
+    try posix.listen(handle.fd, 128);
+
+    // Accept incoming.
+    var c1 = Completion{};
+    var conns: usize = 0;
+    loop.acceptStart(&c1, usize, &conns, &handle, struct {
+        fn on_done(
+            _conns: *usize,
+            _: *Loop,
+            _: *Completion,
+            _: *Handle,
+            result: posix.AcceptError!posix.socket_t,
+        ) void {
+            if (_conns.* > 3) posix.exit(0);
+
+            std.debug.print("got connection\t{}\n", .{result catch unreachable});
+            _conns.* += 1;
         }
     }.on_done);
 

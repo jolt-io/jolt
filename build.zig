@@ -15,37 +15,35 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    // This creates a "module", which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Every executable or library we compile will be based on one or more modules.
-    //const lib_mod = b.createModule(.{
-    //    // `root_source_file` is the Zig "entry point" of the module. If a module
-    //    // only contains e.g. external object files, you can make this `null`.
-    //    // In this case the main source file is merely a path, however, in more
-    //    // complicated build scripts, this could be a generated file.
-    //    .root_source_file = b.path("src/root.zig"),
-    //    .target = target,
-    //    .optimize = optimize,
-    //});
-
-    // Expose jolt as a public module.
-    const jolt_module = b.addModule("jolt", .{
-        .root_source_file = b.path("src/jolt.zig"),
+    const io_module = b.addModule("jolt/io", .{
+        .root_source_file = b.path("modules/io/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
-    const lib_unit_tests = b.addTest(.{
-        .root_module = jolt_module,
+    const http_module = b.addModule("jolt/http", .{
+        .root_source_file = b.path("modules/http/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "jolt/io", .module = io_module },
+        },
     });
 
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    const executable = b.addExecutable(.{
+        .name = "jolt-test-executable",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "jolt/io", .module = io_module },
+                .{ .name = "jolt/http", .module = http_module },
+            },
+        }),
+    });
 
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
+    const run_artifact = b.addRunArtifact(executable);
+    const run_step = b.step("run", "run executable");
+    run_step.dependOn(&run_artifact.step);
 }
